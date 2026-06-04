@@ -1,0 +1,208 @@
+# 榕能电力审图知识库 RAG 系统配置
+
+# ===== 路径配置 =====
+paths:
+  knowledge_base: "D:/榕能电力审图项目资料/知识库"
+  metadata_db: "D:/rag-system/data/file_metadata.db"
+  milvus_db: "D:/rag-system/data/milvus_lite.db"
+  parsed_cache: "D:/rag-system/data/parsed_cache"
+  uploads_dir: "D:/rag-system/data/uploads"
+  models_dir: "D:/rag-system/models"
+
+# ===== 知识库域配置 =====
+domains:
+  变电:
+    path: "变电"
+    categories:
+      - 标准规范
+      - 技术文件
+      - 设计图纸
+      - 设计规范
+      - 通知意见
+      - 会议纪要
+      - 培训资料
+      - 物资采购
+      - 造价与费用
+      - 三维设计
+      - 研究技术报告
+      - 设计公司文件
+  配电:
+    path: "配电"
+    categories:
+      - 标准规范
+      - 技术文件
+      - 通用设计典设
+      - 设计规范
+      - 图审要求
+      - 差异化设计
+      - 通知意见
+      - 物料与技术规范书
+      - 造价与费用
+      - 培训资料
+      - 管理办法
+      - 设计图集
+      - 专题场景
+  送电输电:
+    path: "送电输电"
+    categories:
+      - 标准规范
+      - 设计规程
+      - 反事故措施
+      - 水土保持环保
+      - 通信
+      - 通知意见
+  综合:
+    path: "综合"
+    categories:
+      - 省公司发文
+      - 地市公司发文
+      - 公共培训资料
+      - 跨域通用文件
+      - 杂项
+
+# ===== 域关键词典（查询分类用） =====
+domain_keywords:
+  变电: ["变电站", "变电", "变电所", "换流站", "GIS", "主变", "配电装置", "主接线",
+         "电气一次", "电气二次", "继电保护", "综合自动化", "直流系统"]
+  配电: ["配电", "配网", "配电网", "10kV", "20kV", "箱变", "配电室", "充电站",
+         "充电桩", "台区", "低压", "光伏", "分布式", "环网柜"]
+  送电输电: ["输电", "送电", "架空线路", "杆塔", "电缆线路", "线路走廊", "导线",
+              "地线", "OPGW", "绝缘子", "防振锤", "跨越", "耐张"]
+  综合: ["省公司", "市公司", "发文", "管理制度", "费用标准", "定额", "信息价"]
+
+# ===== 标签关键词典 =====
+publish_level_patterns:
+  国标: ["GB[/T]?\\s*\\d", "国标", "国家标准"]
+  行标: ["DL[/T]?\\s*\\d", "DLT", "行标", "行业标准"]
+  企标: ["Q/GDW", "企标", "企业标准"]
+  国网公司: ["国家电网", "国网", "国家电网公司"]
+  省公司_福建: ["闽电", "福建电力", "福建省电力", "福建省公司"]
+  地市公司_福州: ["榕电", "榕能", "福州供电", "福州电力"]
+
+voltage_patterns:
+  "10kV": ["10kV", "10千伏", "10 kv", "~10kV"]
+  "20kV": ["20kV", "20千伏"]
+  "35kV": ["35kV", "35千伏"]
+  "66kV": ["66kV", "66千伏"]
+  "110kV": ["110kV", "110千伏"]
+  "220kV": ["220kV", "220千伏"]
+  "500kV": ["500kV", "500千伏"]
+  "750kV+": ["750kV", "1000kV", "特高压"]
+
+discipline_patterns:
+  电气一次: ["电气一次", "一次", "主接线", "配电装置", "GIS", "母线", "高压"]
+  电气二次: ["电气二次", "二次", "监控系统", "自动化", "测控", "信息模型"]
+  土建: ["土建", "建筑", "结构", "基础", "地基", "消防", "暖通", "给排水"]
+  线路: ["线路", "架空", "电缆", "杆塔", "导线", "送电", "输电"]
+  保护: ["保护", "继电", "继电保护", "调度", "安稳", "安自"]
+  通信: ["通信", "光缆", "光纤", "SDH", "OTN", "信息"]
+
+equipment_patterns:
+  变压器: ["变压器", "主变", "配变", "站用变", "接地变"]
+  开关柜GIS: ["GIS", "开关柜", "环网柜", "充气柜", "中置柜"]
+  断路器: ["断路器", "SF6", "真空断路器"]
+  电缆导线: ["电缆", "导线", "架空线", "绝缘导线"]
+  继电保护: ["保护装置", "继电保护", "差动保护", "距离保护", "过流保护"]
+  互感器: ["互感器", "CT", "PT", "CVT", "电流互感器", "电压互感器"]
+  避雷器: ["避雷器", "SPD", "过电压保护"]
+  直流系统: ["直流", "蓄电池", "充电机", "UPS", "一体化电源"]
+  监控系统: ["监控", "SCADA", "远动", "RTU"]
+  新能源: ["光伏", "储能", "充电桩", "风电", "分布式电源"]
+
+doc_number_patterns:
+  # 公司发文编号
+  min_dian: '闽电\S*〔\d{4}〕\d+号'
+  rong_neng: '榕能\S*〔\d{4}〕\d+号'
+  rong_dian: '榕电\S*〔\d{4}〕\d+号'
+  ji_jian: '基建\S*〔\d{4}〕\d+号'
+  guo_wang_qi_guan: '国家电网企管〔\d{4}〕\d+号'
+  guo_wang_ji_jian: '国家电网基建〔\d{4}〕\d+号'
+  yun_jian: '运检\S*〔\d{4}〕\d+号'
+  diao_ji: '调继〔\d{4}〕\d+号'
+  # 标准编号
+  gb_standard: 'GB[/T]?\s*\d+[\.-]\d+'
+  dl_standard: 'DL[/T]?\s*\d+[\.-]\d+'
+  qgdw_standard: 'Q/GDW\s*\d+[\.-]\d+'
+
+# ===== 绘图图号提取规则 =====
+drawing_code_pattern: '(?P<voltage>\d+)-(?P<scheme>[A-Z]\d+-\d+)-(?P<discipline_code>[A-Z]\d+)-(?P<drawing_seq>\d+)'
+drawing_discipline_map:
+  D01: "电气一次"
+  D02: "电气二次"
+  D03: "电气一次"
+  D04: "电气一次"
+  S01: "给排水/水工"
+  T01: "土建"
+  T02: "结构"
+  T03: "构支架基础"
+  N01: "暖通"
+
+# ===== 分块配置 =====
+chunking:
+  semantic:
+    chunk_size: 512       # tokens (~350-400中文字符)
+    chunk_overlap: 64     # tokens (~40-50中文字符)
+    separators:
+      - "\n\n\n"
+      - "\n\n"
+      - "\n"
+      - "。"
+      - "；"
+      - "，"
+      - ". "
+      - " "
+      - ""
+  single_page:
+    enabled: true
+    max_pages_for_single: 1   # 1页PDF直接作为单个chunk
+  full_document:
+    max_chars_for_full: 1500  # <1500字符的短文档不拆分
+
+# ===== 嵌入模型配置 =====
+embedding:
+  model_name: "BAAI/bge-m3"
+  device: "cpu"             # "cuda" or "cpu"
+  batch_size: 32
+  normalize: true
+  max_length: 8192
+  use_onnx: false           # Set true for ONNX Runtime acceleration
+
+# ===== 重排序器配置 =====
+reranker:
+  model_name: "BAAI/bge-reranker-v2-m3"
+  device: "cpu"
+  batch_size: 16
+  top_k: 15
+  metadata_boosts:
+    exact_doc_number_match: 1.5
+    category_standard: 1.2
+    publish_level_national: 1.1
+
+# ===== 检索配置 =====
+retrieval:
+  coarse_top_k: 50         # Stage 1: hybrid search candidates
+  fine_top_k: 15           # Stage 2: after reranking
+  rrf_k: 60                # Reciprocal Rank Fusion parameter
+  dense_weight: 0.6        # Dense embedding weight in hybrid
+  sparse_weight: 0.4       # Sparse lexical weight in hybrid
+  nprobe: 16               # IVF index probe count
+
+# ===== LLM配置 =====
+llm:
+  provider: "ollama"        # "ollama" or "llama_cpp"
+  ollama:
+    model: "qwen2.5:7b-instruct-q4_K_M"
+    base_url: "http://localhost:11434"
+    temperature: 0.1
+    num_ctx: 32768
+  # 备选模型: "qwen2.5:14b-instruct-q4_K_M" (更大更准确，需更多显存)
+
+# ===== API配置 =====
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+# ===== 增量更新 =====
+incremental:
+  watch_interval_seconds: 300    # 5 minutes between scans
+  enable_auto_index: true

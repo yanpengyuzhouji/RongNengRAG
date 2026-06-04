@@ -1,0 +1,48 @@
+# ===== Core RAG Framework =====
+pymilvus>=2.4.0          # Milvus Lite vector database (hybrid search)
+langchain>=0.3.0         # Text splitters + document loaders
+langchain-text-splitters>=0.3.0
+
+# ===== Embedding & Reranking =====
+sentence-transformers>=3.0.0  # BGE-M3 + BGE-Reranker
+FlagEmbedding>=1.3.0          # BAAI embedding models (BGE-M3, BGE-Reranker)
+# torch -- install separately per CUDA/CPU requirement
+
+# ===== Document Parsing =====
+PyMuPDF>=1.24.0           # PDF text extraction (fitz)
+python-docx>=1.1.0        # DOCX parsing
+python-pptx>=1.0.0        # PPTX parsing
+openpyxl>=3.1.0           # XLSX parsing
+xlrd>=2.0.1               # XLS parsing
+ofdparser>=1.0.0          # OFD parsing (Chinese fixed-layout docs)
+
+# ===== OCR (fallback for scanned PDFs/images) =====
+paddleocr>=2.8.0          # Chinese OCR
+paddlepaddle>=3.0.0       # PaddlePaddle runtime
+
+# ===== Archive Handling =====
+rarfile>=4.1              # RAR archive extraction
+
+# ===== LLM Inference =====
+llama-cpp-python>=0.3.0   # GGUF model inference
+openai>=1.0.0             # For OpenAI-compatible API (Ollama)
+
+# ===== API & UI =====
+fastapi>=0.115.0          # REST API
+uvicorn[standard]>=0.30.0 # ASGI server
+pydantic>=2.0.0           # Data validation
+streamlit>=1.35.0         # Web UI
+
+# ===== Utilities =====
+pyyaml>=6.0               # Configuration
+rich>=13.0.0              # Console output formatting
+tqdm>=4.66.0              # Progress bars
+python-multipart>=0.0.9   # File upload support
+watchdog>=4.0.0           # File system monitoring for incremental updates
+
+# ===== Legacy format support =====
+pywin32>=306              # Windows COM (Word, Apabi Reader automation)
+comtypes>=1.4.0           # COM type library support
+
+# ===== Database =====
+# SQLite is built into Python stdlib
