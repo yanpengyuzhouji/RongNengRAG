@@ -160,17 +160,27 @@ chunking:
 
 # ===== 嵌入模型配置 =====
 embedding:
+  provider: "ollama"            # "ollama" (本地Ollama) 或 "sentence_transformers" (HuggingFace)
+  ollama:
+    model: "bge-m3:latest"       # Ollama 嵌入模型
+    base_url: "http://localhost:11434"
+  # sentence_transformers 回退配置 (provider=sentence_transformers 时使用)
   model_name: "BAAI/bge-m3"
-  device: "cpu"             # "cuda" or "cpu"
+  device: "cuda"
   batch_size: 32
   normalize: true
   max_length: 8192
-  use_onnx: false           # Set true for ONNX Runtime acceleration
+  use_onnx: false
 
 # ===== 重排序器配置 =====
 reranker:
-  model_name: "BAAI/bge-reranker-v2-m3"
-  device: "cpu"
+  provider: "ollama"            # "ollama" (Ollama嵌入+余弦相似度) 或 "flagembedding" (HuggingFace)
+  ollama:
+    model: "bge-m3:latest"       # 用嵌入模型做相似度重排序
+    base_url: "http://localhost:11434"
+  # flagembedding 回退配置 (provider=flagembedding 时使用)
+  model_name: "dengcao/bge-reranker-v2-m3"
+  device: "cuda"
   batch_size: 16
   top_k: 15
   metadata_boosts:
@@ -191,7 +201,7 @@ retrieval:
 llm:
   provider: "ollama"        # "ollama" or "llama_cpp"
   ollama:
-    model: "qwen2.5:7b-instruct-q4_K_M"
+    model: "qwen3:8b"
     base_url: "http://localhost:11434"
     temperature: 0.1
     num_ctx: 32768

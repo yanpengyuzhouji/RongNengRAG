@@ -136,16 +136,24 @@ class Retriever:
         if len(candidates) <= top_k:
             ranked = candidates
         else:
-            ranked = self.reranker.rerank(
-                query=query,
-                candidates=candidates,
-                analyzed_query=aq,
-                top_k=top_k,
-            )
+            try:
+                ranked = self.reranker.rerank(
+                    query=query,
+                    candidates=candidates,
+                    analyzed_query=aq,
+                    top_k=top_k,
+                )
+            except Exception as e:
+                print(f"[warn] 重排序失败，回退元数据排序: {e}")
+                ranked = self.reranker.rerank_without_model(
+                    candidates=candidates,
+                    analyzed_query=aq,
+                    top_k=top_k,
+                )
 
         # ===== 构建响应 =====
         results = []
-        for item in ranked:
+        for item in ranked[:top_k]:
             entity = item.get("entity", item)
             results.append(RetrievalResult(
                 chunk_id=entity.get("chunk_id", ""),

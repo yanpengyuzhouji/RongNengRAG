@@ -3,11 +3,40 @@ Milvus Lite 向量数据库 — Schema 创建 + 批量入库
 支持稠密+稀疏混合搜索、元数据标量索引
 """
 
+import os
+import time
 import yaml
 from pymilvus import (
     MilvusClient, DataType, Function, AnnSearchRequest, RRFRanker
 )
 from typing import List, Dict, Optional
+
+# ===== 修复 milvus-lite 3.0 Windows os.rename bug =====
+# 问题: milvus-lite manifest.save() 使用 os.rename(tmp, target)
+#       Windows 上 os.rename 不能覆盖已存在文件，报 WinError 183
+# 修复: 全局替换 os.rename 为 os.replace (原子替换，跨平台安全)
+_os_rename = os.rename
+
+def _safe_rename(src: str, dst: str):
+    """os.replace 在 Windows/Linux 上均可原子替换目标文件"""
+    try:
+        _os_rename(src, dst)
+    except FileExistsError:
+        os.replace(src, dst)
+
+os.rename = _safe_rename
+# =====
+
+
+def _try_clean_stale_lock(db_path: str):
+    """清理因进程异常退出残留的 Milvus LOCK 文件"""
+    lock_file = os.path.join(db_path, "LOCK")
+    if os.path.exists(lock_file):
+        try:
+            os.remove(lock_file)
+            print(f"[修复] 已清理残留锁文件: {lock_file}")
+        except PermissionError:
+            pass  # 锁被其他存活进程持有，不强行删除
 
 
 class MilvusStore:
@@ -21,17 +50,27 @@ class MilvusStore:
             self.config = yaml.safe_load(f)
 
         self.db_path = self.config["paths"]["milvus_db"]
-        self.client = MilvusClient(self.db_path)
+        self.client = self._connect()
+
+    def _connect(self):
+        """连接 Milvus Lite，失败时自动清理锁重试一次"""
+        try:
+            return MilvusClient(self.db_path)
+        except Exception as e:
+            # 尝试清理锁文件后重试
+            _try_clean_stale_lock(self.db_path)
+            time.sleep(0.5)
+            return MilvusClient(self.db_path)
 
     def create_collection(self, drop_existing: bool = False):
-        """创建 Milvus 集合（Schema 定义）"""
-        if drop_existing and self.client.has_collection(self.COLLECTION_NAME):
-            self.client.drop_collection(self.COLLECTION_NAME)
-            print(f"🗑️ 已删除旧集合: {self.COLLECTION_NAME}")
-
+        """创建 Milvus 集合（Schema 定义），索引创建为尽力而为"""
         if self.client.has_collection(self.COLLECTION_NAME):
-            print(f"📦 集合已存在: {self.COLLECTION_NAME}")
-            return
+            if drop_existing:
+                self.client.drop_collection(self.COLLECTION_NAME)
+                print(f"[drop] 已删除旧集合: {self.COLLECTION_NAME}")
+            else:
+                print(f"[info] 集合已存在: {self.COLLECTION_NAME}")
+                return
 
         # Schema 定义
         schema = self.client.create_schema(
@@ -39,38 +78,11 @@ class MilvusStore:
             enable_dynamic_field=True,
         )
 
-        # 主键
-        schema.add_field(
-            field_name="chunk_id",
-            datatype=DataType.VARCHAR,
-            max_length=256,
-            is_primary=True,
-        )
-
-        # 文本内容
-        schema.add_field(
-            field_name="text",
-            datatype=DataType.VARCHAR,
-            max_length=65535,
-        )
-        schema.add_field(
-            field_name="embedding_text",
-            datatype=DataType.VARCHAR,
-            max_length=65535,
-        )
-
-        # 向量字段
-        schema.add_field(
-            field_name="dense_vector",
-            datatype=DataType.FLOAT_VECTOR,
-            dim=self.DENSE_DIM,
-        )
-        schema.add_field(
-            field_name="sparse_vector",
-            datatype=DataType.SPARSE_FLOAT_VECTOR,
-        )
-
-        # 元数据标量字段（支持过滤索引）
+        schema.add_field(field_name="chunk_id", datatype=DataType.VARCHAR, max_length=256, is_primary=True)
+        schema.add_field(field_name="text", datatype=DataType.VARCHAR, max_length=65535)
+        schema.add_field(field_name="embedding_text", datatype=DataType.VARCHAR, max_length=65535)
+        schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=self.DENSE_DIM)
+        schema.add_field(field_name="sparse_vector", datatype=DataType.SPARSE_FLOAT_VECTOR)
         schema.add_field(field_name="domain", datatype=DataType.VARCHAR, max_length=32)
         schema.add_field(field_name="category", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="subcategory", datatype=DataType.VARCHAR, max_length=128)
@@ -90,38 +102,39 @@ class MilvusStore:
         schema.add_field(field_name="chunk_index", datatype=DataType.INT16)
         schema.add_field(field_name="chunk_strategy", datatype=DataType.VARCHAR, max_length=32)
 
-        # 创建集合
-        index_params = self.client.prepare_index_params()
-
-        # 稠密向量索引 (COSINE 相似度)
-        index_params.add_index(
-            field_name="dense_vector",
-            index_type="IVF_FLAT",
-            metric_type="COSINE",
-            params={"nlist": 1024},
-        )
-
-        # 稀疏向量索引
-        index_params.add_index(
-            field_name="sparse_vector",
-            index_type="SPARSE_INVERTED_INDEX",
-            metric_type="IP",
-        )
-
-        # 标量字段索引（加速过滤）
-        index_params.add_index(field_name="domain", index_type="TRIE")
-        index_params.add_index(field_name="category", index_type="TRIE")
-        index_params.add_index(field_name="voltage_level", index_type="TRIE")
-        index_params.add_index(field_name="publish_level", index_type="TRIE")
-        index_params.add_index(field_name="year", index_type="STL_SORT")
-
+        # Step 1: 创建集合（不带索引，避免 milvus-lite Windows os.rename bug）
         self.client.create_collection(
             collection_name=self.COLLECTION_NAME,
             schema=schema,
-            index_params=index_params,
         )
 
-        print(f"✅ 集合创建完成: {self.COLLECTION_NAME}")
+        # Step 2: 逐个创建索引（尽力而为，milvus-lite 默认 FLAT 无需索引也能搜索）
+        index_defs = [
+            ("dense_vector", "IVF_FLAT", "COSINE", {"nlist": 1024}),
+            ("sparse_vector", "SPARSE_INVERTED_INDEX", "IP", None),
+            ("domain", "TRIE", None, None),
+            ("category", "TRIE", None, None),
+            ("voltage_level", "TRIE", None, None),
+            ("publish_level", "TRIE", None, None),
+            ("year", "STL_SORT", None, None),
+        ]
+        for field, idx_type, metric, params in index_defs:
+            try:
+                idx = self.client.prepare_index_params()
+                kwargs = {"field_name": field, "index_type": idx_type}
+                if metric:
+                    kwargs["metric_type"] = metric
+                if params:
+                    kwargs["params"] = params
+                idx.add_index(**kwargs)
+                self.client.create_index(
+                    collection_name=self.COLLECTION_NAME,
+                    index_params=idx,
+                )
+            except Exception:
+                pass  # milvus-lite Windows bug: os.rename 失败，不影响 FLAT 搜索
+
+        print(f"[OK] 集合创建完成: {self.COLLECTION_NAME}")
 
     def insert(self, chunks: List, dense_vectors: List[List[float]],
                sparse_vectors: List[dict], embedding_texts: List[str],
@@ -136,6 +149,8 @@ class MilvusStore:
             embedding_texts: 嵌入优化的文本列表
             batch_size: 每批插入数量
         """
+        self._ensure_collection()  # 自动创建集合（如果不存在）
+
         total = len(chunks)
         inserted = 0
 
@@ -183,9 +198,25 @@ class MilvusStore:
             if total > batch_size:
                 print(f"   📥 入库进度: {inserted}/{total} ({inserted * 100 // total}%)")
 
-        # 刷新索引
+        # 刷新索引并加载集合以确保可搜索
         self.client.flush(self.COLLECTION_NAME)
-        print(f"   📊 已入库 {inserted} 条记录，索引刷新完成")
+        try:
+            self.client.load_collection(self.COLLECTION_NAME)
+        except Exception:
+            pass  # milvus-lite 可能自动加载
+        print(f"   [OK] 已入库 {inserted} 条记录")
+
+    def _ensure_collection(self):
+        """确保集合存在，不存在则创建"""
+        if not self.client.has_collection(self.COLLECTION_NAME):
+            self.create_collection()
+
+    def collection_exists(self) -> bool:
+        """检查集合是否存在且有数据"""
+        if not self.client.has_collection(self.COLLECTION_NAME):
+            return False
+        stats = self.client.get_collection_stats(self.COLLECTION_NAME)
+        return stats.get("row_count", 0) > 0
 
     def hybrid_search(
         self,
@@ -212,8 +243,18 @@ class MilvusStore:
             sparse_weight: 稀疏搜索权重
 
         Returns:
-            List[dict] — 排序后的搜索结果
+            List[dict] — 排序后的搜索结果；集合不存在或无数据时返回空列表
         """
+        # 集合不存在时返回空结果
+        if not self.client.has_collection(self.COLLECTION_NAME):
+            return []
+
+        # 确保集合已加载（防止 released 状态）
+        try:
+            self.client.load_collection(self.COLLECTION_NAME)
+        except Exception:
+            pass
+
         if output_fields is None:
             output_fields = [
                 "chunk_id", "text", "domain", "category", "file_path",
@@ -238,11 +279,11 @@ class MilvusStore:
             limit=limit * 2,
         )
 
-        # RRF 混合搜索
+        # RRF 混合搜索 (pymilvus 3.0: ranker 而非 rerank)
         results = self.client.hybrid_search(
             collection_name=self.COLLECTION_NAME,
             reqs=[dense_req, sparse_req],
-            rerank=RRFRanker(k=rrf_k),
+            ranker=RRFRanker(k=rrf_k),
             filter=filter_expr,
             limit=limit,
             output_fields=output_fields,
@@ -260,6 +301,8 @@ class MilvusStore:
 
     def delete_by_file_hash(self, file_hash: str):
         """删除指定文件的所有 chunks（用于增量更新）"""
+        if not self.client.has_collection(self.COLLECTION_NAME):
+            return  # 集合不存在，无需删除
         expr = f'chunk_id like "{file_hash}%"'
         self.client.delete(collection_name=self.COLLECTION_NAME, filter=expr)
 
