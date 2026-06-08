@@ -109,9 +109,9 @@ class Chunk:
 class Chunker:
     """格式感知的分块器"""
 
-    def __init__(self, config_path: str = "D:/rag-system/config.yaml"):
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self, config_path: str = None):
+        from config import load_config
+        self.config = load_config(config_path)
 
         chunk_config = self.config["chunking"]
         self.semantic_chunk_size = chunk_config["semantic"]["chunk_size"]

@@ -1,9 +1,14 @@
 """
-榕能电力审图知识库 — Gradio 交互界面
-HTTP 客户端模式，所有操作通过 FastAPI 完成
+榕能电力审图知识库 — Gradio 交互界面 v3.0
+- 侧边栏会话管理 + 聊天界面
+- 流式生成回答
+- 北京时间显示
+- 多轮对话 + 会话隔离
+- 文件管理 + 检索 + 统计 (保留原有功能)
 """
 
 import os
+import json
 import time
 import requests
 import gradio as gr
@@ -31,88 +36,190 @@ def _api(method: str, path: str, **kwargs) -> dict | list | str:
         return f"[ERROR] 请求失败: {e}"
 
 
-# ========== 文件缓存 ==========
-_file_cache = {"files": [], "ts": 0}
+# ========== 会话管理 ==========
 
-def _refresh_file_cache():
-    """刷新文件列表缓存（默认排除已删除文件）"""
-    result = _api("GET", "/files", params={"limit": 500, "offset": 0})
-    if not isinstance(result, str):
-        all_files = result.get("files", [])
-        # 默认排除已删除的文件
-        _file_cache["files"] = [f for f in all_files if f.get("status") != "deleted"]
-        _file_cache["ts"] = time.time()
-    return _file_cache["files"]
-
-
-# ========== 智能问答 ==========
-
-def rag_ask(query: str, domain: str, top_k: int):
-    if not query.strip():
-        return "请输入问题", ""
-    t0 = time.time()
-
-    domain_filter = None if domain == "全部" else domain
-    result = _api("POST", "/ask", json={
-        "query": query, "top_k": top_k, "domain_filter": domain_filter,
-    })
-
-    elapsed = (time.time() - t0) * 1000
-
+def _create_conversation(title: str = "") -> str:
+    """创建新会话，返回 conv_id"""
+    result = _api("POST", "/conversations", json={"title": title})
     if isinstance(result, str):
-        return result, ""
-
-    answer = result.get("answer", "")
-    citations = result.get("citations", [])
-    sources = result.get("sources", [])
-
-    source_lines = []
-    for s in sources[:10]:
-        fname = os.path.basename(s.get("file_path", ""))
-        source_lines.append(f"- **{s.get('doc_number') or '无编号'}** | {s.get('domain','?')}/{s.get('category','?')} | `{fname}`")
-
-    info = f"[API] 耗时: {elapsed:.0f}ms | 引用: {len(citations)} 条 | 来源: {len(sources)} 个\n\n" + "\n".join(source_lines)
-    return answer, info
+        return ""
+    return result.get("conv_id", "")
 
 
-# ========== 文档检索 ==========
-
-def search_only(query: str, domain: str, top_k: int):
-    if not query.strip():
-        return "请输入查询内容"
-    t0 = time.time()
-
-    domain_filter = None if domain == "全部" else domain
-    result = _api("POST", "/search", json={
-        "query": query, "top_k": top_k, "domain_filter": domain_filter,
-    })
-
-    elapsed = (time.time() - t0) * 1000
-
+def _list_conversations() -> list:
+    """获取会话列表"""
+    result = _api("GET", "/conversations")
     if isinstance(result, str):
-        return result
+        return []
+    return result
 
-    domain_label = {"变电": "[变]", "配电": "[配]", "送电输电": "[送]", "综合": "[综]"}
-    lines = [
-        f"### 检索: _{query}_",
-        f"**类型:** {result.get('query_type','?')} | **候选:** {result.get('total_candidates',0)} | **耗时:** {elapsed:.0f}ms",
-        f"---",
-    ]
-    for i, item in enumerate(result.get("results", [])):
-        dm = item.get("domain", "")
-        lbl = domain_label.get(dm, "[?]")
-        fname = os.path.basename(item.get("file_path", ""))
-        if not fname:
-            fname = item.get("doc_number", "") or "未知文件"
-        lines.append(f"### {lbl} [{i+1}] {fname}")
-        lines.append(f"**{dm}/{item.get('category','-')}** | 电压:{item.get('voltage_level') or '-'} | 发布:{item.get('publish_level') or '-'}")
-        lines.append(f"> {item.get('text','')[:300]}")
-        lines.append("")
 
-    if not result.get("results"):
-        lines.append("[INFO] 知识库为空，请先上传文件。")
+def _get_conversation(conv_id: str) -> dict:
+    """获取会话详情"""
+    result = _api("GET", f"/conversations/{conv_id}")
+    if isinstance(result, str):
+        return {}
+    return result
 
-    return "\n".join(lines)
+
+def _delete_conversation(conv_id: str) -> bool:
+    """删除会话"""
+    result = _api("DELETE", f"/conversations/{conv_id}")
+    return not isinstance(result, str)
+
+
+# ========== 聊天功能 ==========
+
+def refresh_conv_list():
+    """刷新会话列表 (sidebar)"""
+    convs = _list_conversations()
+    choices = []
+    for c in convs:
+        preview = c.get("preview", "")[:40]
+        updated = c.get("updated_at", "")[:16].replace("T", " ")
+        label = f"{c.get('title','?')[:25]} | {updated}"
+        choices.append((label, c.get("conv_id", "")))
+    if not choices:
+        choices = [("(暂无会话)", "")]
+    return gr.update(choices=choices, value=None)
+
+
+def new_conversation():
+    """创建新会话并刷新列表"""
+    conv_id = _create_conversation()
+    if not conv_id:
+        return None, "", [], refresh_conv_list()
+    # 返回新会话ID并清空聊天
+    return conv_id, conv_id, [], refresh_conv_list()
+
+
+def load_conversation(conv_id: str):
+    """加载指定会话的历史消息到 chatbot"""
+    if not conv_id:
+        return [], conv_id, ""
+
+    conv = _get_conversation(conv_id)
+    if not conv:
+        return [], conv_id, ""
+
+    messages = conv.get("messages", [])
+    chatbot_msgs = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        ts = m.get("timestamp", "")[:19].replace("T", " ")
+        if role == "user":
+            chatbot_msgs.append({"role": "user", "content": content})
+        else:
+            # 在助手消息末尾加时间戳
+            display = content + f"\n\n---\n*{ts} (北京时间)*"
+            chatbot_msgs.append({"role": "assistant", "content": display})
+
+    return chatbot_msgs, conv_id, ""
+
+
+def delete_current_conv(conv_id: str):
+    """删除当前会话"""
+    if not conv_id:
+        return None, "", [], refresh_conv_list()
+    _delete_conversation(conv_id)
+    new_id = _create_conversation()
+    return new_id, new_id, [], refresh_conv_list()
+
+
+def chat_stream(query: str, history: list, conv_id: str, domain_filter: str, top_k: int):
+    """流式聊天 - Gradio generator"""
+    if not query or not query.strip():
+        yield history, conv_id
+        return
+
+    if not conv_id:
+        conv_id = _create_conversation()
+        if not conv_id:
+            history.append({"role": "assistant", "content": "[ERROR] 无法创建会话"})
+            yield history, conv_id
+            return
+
+    # 添加用户消息
+    history.append({"role": "user", "content": query})
+
+    # 先用占位符添加 assistant 消息
+    time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    history.append({"role": "assistant", "content": "🔍 检索中..."})
+
+    yield history, conv_id
+
+    # 调用流式 API
+    try:
+        domain_val = None if domain_filter == "全部" else domain_filter
+        resp = requests.post(
+            f"{API_BASE}/ask/stream",
+            json={
+                "query": query,
+                "top_k": top_k,
+                "domain_filter": domain_val,
+                "conversation_id": conv_id,
+            },
+            stream=True,
+            timeout=(120, 900),  # 120s连接等待 + 900s流式读取
+        )
+
+        full_answer = ""
+        thinking_shown = False
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8", errors="ignore")
+            if line_str.startswith("data: "):
+                try:
+                    data = json.loads(line_str[6:])
+                    token = data.get("token", "")
+                    done = data.get("done", False)
+                    status = data.get("status", "")
+
+                    if done:
+                        if data.get("full_answer"):
+                            full_answer = data.get("full_answer", full_answer)
+                        break
+
+                    if status == "searching":
+                        history[-1] = {"role": "assistant", "content": "🔍 检索中..."}
+                        yield history, conv_id
+                        continue
+
+                    if status == "thinking":
+                        # Qwen3 推理模型思考中 — 显示动画
+                        if not thinking_shown:
+                            thinking_shown = True
+                        dots_count = ((int(time.time() * 2) % 4) + 1)
+                        dots = "." * dots_count
+                        history[-1] = {"role": "assistant", "content": f"💭 思考中{dots}\n*(Qwen3 推理模型正在分析问题...)*"}
+                        yield history, conv_id
+                        continue
+
+                    # 有实际内容了
+                    thinking_shown = False
+                    full_answer += token
+                    display = full_answer + "\n\n---\n*" + time_str + " (北京时间)*"
+                    history[-1] = {"role": "assistant", "content": display}
+                    yield history, conv_id
+
+                except json.JSONDecodeError:
+                    pass
+
+        # 最终更新
+        if full_answer:
+            display = full_answer + "\n\n---\n*" + time_str + " (北京时间)*"
+            history[-1] = {"role": "assistant", "content": display}
+        else:
+            history[-1] = {"role": "assistant", "content": "[WARN] 未获取到回答"}
+
+    except requests.ConnectionError:
+        history[-1] = {"role": "assistant", "content": "[ERROR] 无法连接后端 API"}
+    except Exception as e:
+        history[-1] = {"role": "assistant", "content": f"[ERROR] {str(e)[:200]}"}
+
+    yield history, conv_id
 
 
 # ========== 文件上传入库 ==========
@@ -167,7 +274,6 @@ def _build_file_tree(files: list) -> str:
     if not files:
         return "[INFO] 暂无入库文件，请先上传文档。"
 
-    # 按域分组
     by_domain = {}
     for f in sorted(files, key=lambda x: (x.get("domain",""), x.get("category",""), x.get("file_name",""))):
         dm = f.get("domain", "") or "未分类"
@@ -198,6 +304,7 @@ def _build_file_tree(files: list) -> str:
 
         for cat in sorted(cats.keys()):
             cat_files = cats[cat]
+            lines.append("")  # 空行确保类目间换行
             lines.append(f"**{cat}** ({len(cat_files)})")
             for f in cat_files:
                 st = f.get("status", "?")
@@ -213,14 +320,11 @@ def _build_file_tree(files: list) -> str:
 
 
 def refresh_file_list(status_filter: str, domain_filter: str, search: str):
-    """带过滤的刷新文件列表"""
-    # 直接从 API 获取（不过滤 deleted，让状态过滤自己决定）
     result = _api("GET", "/files", params={"limit": 500, "offset": 0})
     if isinstance(result, str):
         return f"[ERROR] {result}", gr.update()
     files = result.get("files", [])
 
-    # 默认排除已删除
     if status_filter == "全部" or not status_filter:
         files = [f for f in files if f.get("status") != "deleted"]
     elif status_filter:
@@ -240,46 +344,16 @@ def refresh_file_list(status_filter: str, domain_filter: str, search: str):
     return tree, gr.update(choices=choices, value=None)
 
 
-def delete_selected(file_id: str):
-    """删除选中文件"""
-    if not file_id or not file_id.strip():
-        return "[WARN] 请先选择一个文件", gr.update(), gr.update()
-
-    result = _api("DELETE", f"/files/{file_id.strip()}")
-    if isinstance(result, str):
-        return result, gr.update(), gr.update()
-
-    # 重新从 API 获取（排除已删除）
-    api_result = _api("GET", "/files", params={"limit": 500, "offset": 0})
-    if isinstance(api_result, str):
-        files = []
-    else:
-        files = [f for f in api_result.get("files", []) if f.get("status") != "deleted"]
-
-    tree = _build_file_tree(files)
-    choices = []
-    for f in sorted(files, key=lambda x: x.get("file_name","")):
-        label = f"{f.get('file_name','?')[:50]} [{f.get('chunks_count',0)}c]"
-        choices.append((label, f.get("file_hash", "")))
-
-    return f"[OK] 已删除: {file_id[:16]}...", tree, gr.update(choices=choices, value=None)
-
-
 def view_file_details(file_id: str):
-    """查看文件详情"""
+    """查看文件详情 (先查 API)"""
     if not file_id or not file_id.strip():
         return "[INFO] 请在左侧选择一个文件查看详情"
 
-    files = _file_cache.get("files", [])
-    target = None
-    for f in files:
-        if f.get("file_hash") == file_id.strip() or f.get("file_name") == file_id.strip():
-            target = f
-            break
-
-    if not target:
+    result = _api("GET", f"/files/{file_id.strip()}")
+    if isinstance(result, str):
         return f"[WARN] 未找到: {file_id}"
 
+    target = result
     lines = [
         f"### 文件详情",
         f"| 属性 | 值 |",
@@ -298,15 +372,82 @@ def view_file_details(file_id: str):
     return "\n".join(lines)
 
 
+def delete_selected(file_id: str):
+    if not file_id or not file_id.strip():
+        return "[WARN] 请先选择一个文件", gr.update(), gr.update()
+
+    result = _api("DELETE", f"/files/{file_id.strip()}")
+    if isinstance(result, str):
+        return result, gr.update(), gr.update()
+
+    api_result = _api("GET", "/files", params={"limit": 500, "offset": 0})
+    if isinstance(api_result, str):
+        files = []
+    else:
+        files = [f for f in api_result.get("files", []) if f.get("status") != "deleted"]
+
+    tree = _build_file_tree(files)
+    choices = []
+    for f in sorted(files, key=lambda x: x.get("file_name","")):
+        label = f"{f.get('file_name','?')[:50]} [{f.get('chunks_count',0)}c]"
+        choices.append((label, f.get("file_hash", "")))
+
+    return f"[OK] 已删除: {file_id[:16]}...", tree, gr.update(choices=choices, value=None)
+
+
+# ========== 文档检索 ==========
+
+def search_only(query: str, domain: str, top_k: int):
+    if not query.strip():
+        return "请输入查询内容"
+    t0 = time.time()
+
+    domain_filter = None if domain == "全部" else domain
+    result = _api("POST", "/search", json={
+        "query": query, "top_k": top_k, "domain_filter": domain_filter,
+    })
+
+    elapsed = (time.time() - t0) * 1000
+
+    if isinstance(result, str):
+        return result
+
+    domain_label = {"变电": "[变]", "配电": "[配]", "送电输电": "[送]", "综合": "[综]"}
+    lines = [
+        f"### 检索: _{query}_",
+        f"**类型:** {result.get('query_type','?')} | **候选:** {result.get('total_candidates',0)} | **耗时:** {elapsed:.0f}ms",
+        f"---",
+    ]
+    for i, item in enumerate(result.get("results", [])):
+        dm = item.get("domain", "")
+        lbl = domain_label.get(dm, "[?]")
+        fname = os.path.basename(item.get("file_path", ""))
+        if not fname:
+            fname = item.get("doc_number", "") or "未知文件"
+        confidence = item.get("confidence", 0)
+        conf_bar = "█" * int(confidence * 10) + "░" * (10 - int(confidence * 10))
+        lines.append(f"### {lbl} [{i+1}] {fname}")
+        lines.append(f"**{dm}/{item.get('category','-')}** | 电压:{item.get('voltage_level') or '-'} | 发布:{item.get('publish_level') or '-'} | 置信度:{confidence:.0%} {conf_bar}")
+        lines.append(f"> {item.get('text','')[:300]}")
+        lines.append("")
+
+    if not result.get("results"):
+        lines.append("[INFO] 知识库为空，请先上传文件。")
+
+    return "\n".join(lines)
+
+
+# ========== 统计 ==========
+
 def refresh_stats():
     result = _api("GET", "/files/summary")
     if isinstance(result, str):
-        return result, 0, 0, {}
+        return result
 
-    total = result.get("total_files", 0)
-    chunks = result.get("total_chunks", 0)
     by_domain = result.get("by_domain", {})
     by_status = result.get("by_status", {})
+    total = result.get("total_files", 0)
+    chunks = result.get("total_chunks", 0)
 
     lines = [
         "### 入库统计",
@@ -323,35 +464,107 @@ def refresh_stats():
     for dm, cnt in sorted(by_domain.items(), key=lambda x: -x[1]):
         lines.append(f"- {dm}: {cnt} 个文件")
 
-    # 饼图数据
-    return "\n".join(lines), total, chunks, by_domain
+    return "\n".join(lines)
 
 
-# ========== UI ==========
+# ========== UI 布局 ==========
 
-with gr.Blocks(title="榕能电力审图知识库 RAG", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 榕能电力审图知识库 — 智能问答系统")
+CSS = """
+.sidebar { padding: 10px; }
+.chatbot { min-height: 500px; }
+"""
 
-    # 初始化文件缓存
-    _refresh_file_cache()
+with gr.Blocks(title="榕能电力审图知识库 RAG", theme=gr.themes.Soft(), css=CSS) as demo:
+    # 会话状态
+    current_conv = gr.State(value="")
 
     with gr.Tabs():
-        # ===== Tab 1: 智能问答 =====
+        # ===== Tab 1: 智能问答 (聊天界面) =====
         with gr.TabItem("智能问答"):
             with gr.Row():
-                with gr.Column(scale=3):
-                    qa_query = gr.Textbox(label="输入问题", lines=3,
-                        placeholder="变电消防要求？10kV配电安全距离？")
+                # 左侧会话边栏
+                with gr.Column(scale=1, elem_classes="sidebar"):
+                    gr.Markdown("### 会话列表")
+                    new_conv_btn = gr.Button("＋ 新建会话", variant="primary", size="sm")
+                    conv_list = gr.Dropdown(
+                        label="选择会话",
+                        choices=[("(暂无会话)", "")],
+                        interactive=True,
+                    )
                     with gr.Row():
-                        qa_domain = gr.Dropdown(choices=["全部","变电","配电","送电输电","综合"],
-                            value="全部", label="专业域过滤", scale=2)
-                        qa_topk = gr.Slider(5, 30, 15, 5, label="参考文档数", scale=1)
-                    qa_btn = gr.Button("提问", variant="primary", size="lg")
-                with gr.Column(scale=2):
-                    qa_info = gr.Markdown("")
-            qa_answer = gr.Markdown("> 等待提问...")
-            qa_btn.click(fn=rag_ask, inputs=[qa_query, qa_domain, qa_topk],
-                        outputs=[qa_answer, qa_info])
+                        refresh_conv_btn = gr.Button("刷新", size="sm")
+                        delete_conv_btn = gr.Button("删除会话", variant="stop", size="sm")
+
+                # 右侧聊天区
+                with gr.Column(scale=3):
+                    chatbot = gr.Chatbot(
+                        label="对话",
+                        type="messages",
+                        height=550,
+                        show_copy_button=True,
+                    )
+                    with gr.Row():
+                        chat_input = gr.Textbox(
+                            label="输入问题",
+                            placeholder="变电消防要求？10kV配电安全距离？",
+                            scale=4,
+                            lines=2,
+                        )
+                    with gr.Row():
+                        chat_domain = gr.Dropdown(
+                            choices=["全部","变电","配电","送电输电","综合"],
+                            value="全部", label="专业域过滤", scale=1
+                        )
+                        chat_topk = gr.Slider(5, 30, 15, 5, label="参考文档数", scale=1)
+                        chat_send = gr.Button("发送", variant="primary", scale=1)
+
+            # 会话管理事件
+            new_conv_btn.click(
+                fn=new_conversation,
+                outputs=[current_conv, conv_list, chatbot, conv_list]
+            ).then(
+                fn=lambda: None, outputs=[chat_input]
+            )
+
+            refresh_conv_btn.click(
+                fn=refresh_conv_list,
+                outputs=[conv_list]
+            )
+
+            conv_list.select(
+                fn=load_conversation,
+                inputs=[conv_list],
+                outputs=[chatbot, current_conv, chat_input]
+            )
+
+            delete_conv_btn.click(
+                fn=delete_current_conv,
+                inputs=[current_conv],
+                outputs=[current_conv, conv_list, chatbot, conv_list]
+            )
+
+            # 发送消息 (流式)
+            chat_send.click(
+                fn=chat_stream,
+                inputs=[chat_input, chatbot, current_conv, chat_domain, chat_topk],
+                outputs=[chatbot, current_conv]
+            ).then(
+                fn=lambda: "", outputs=[chat_input]
+            )
+
+            chat_input.submit(
+                fn=chat_stream,
+                inputs=[chat_input, chatbot, current_conv, chat_domain, chat_topk],
+                outputs=[chatbot, current_conv]
+            ).then(
+                fn=lambda: "", outputs=[chat_input]
+            )
+
+            # 页面加载时初始化
+            demo.load(
+                fn=refresh_conv_list,
+                outputs=[conv_list]
+            )
 
         # ===== Tab 2: 文件入库 =====
         with gr.TabItem("文件入库"):
@@ -412,7 +625,6 @@ with gr.Blocks(title="榕能电力审图知识库 RAG", theme=gr.themes.Soft()) 
             delete_btn.click(fn=delete_selected, inputs=[file_selector],
                 outputs=[op_result, file_tree, file_selector])
 
-            # 页面加载时自动刷新
             demo.load(fn=refresh_file_list,
                 inputs=[file_status_filter, file_domain_filter, file_search],
                 outputs=[file_tree, file_selector])
@@ -436,14 +648,14 @@ with gr.Blocks(title="榕能电力审图知识库 RAG", theme=gr.themes.Soft()) 
         with gr.TabItem("统计"):
             stats_btn = gr.Button("刷新统计")
             stats_output = gr.Markdown("点击刷新...")
-            stats_file_count = gr.Number(label="文件数", visible=False)
-            stats_chunk_count = gr.Number(label="Chunks", visible=False)
-            stats_btn.click(fn=refresh_stats, outputs=[stats_output, stats_file_count, stats_chunk_count])
+            stats_btn.click(fn=refresh_stats, outputs=[stats_output])
 
-    gr.Markdown("---\n*榕能电力审图知识库 RAG v2.0*")
+    gr.Markdown("---\n*榕能电力审图知识库 RAG v3.0 — 北京时间: {}*".format(
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+
 
 if __name__ == "__main__":
-    print("RAG UI (API client mode)")
+    print("RAG UI v3.0 (streaming + multi-turn conversation)")
     print(f"  Backend: {API_BASE}")
     print("  UI: http://localhost:7860")
     demo.launch(server_name="0.0.0.0", server_port=7860, share=False)

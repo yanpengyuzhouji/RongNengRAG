@@ -86,19 +86,19 @@ class FileProcessor:
         processor.reindex("file_hash_or_path")
     """
 
-    def __init__(self, config_path: str = "D:/rag-system/config.yaml"):
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self, config_path: str = None):
+        from config import load_config, get_config_path, ensure_data_dirs
+        self.config = load_config(config_path)
+        self.config_path = config_path or get_config_path()
 
-        self.config_path = config_path
         self.pdf_parser = PDFParser()
         self.chunker = Chunker(config_path)
         self.embedder = None  # 延迟加载
         self.store = MilvusStore(config_path)
 
-        # 数据库路径
+        # 数据库路径 (已由 load_config 解析为绝对路径)
         self.db_path = self.config["paths"]["metadata_db"]
-        self.uploads_dir = Path(self.config["paths"].get("uploads_dir", "D:/rag-system/data/uploads"))
+        self.uploads_dir = Path(self.config["paths"]["uploads_dir"])
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
 
         self._init_registry()
@@ -566,6 +566,13 @@ class FileProcessor:
                 parsed = self.pdf_parser.parse(file_path)
                 return self.chunker.chunk_pdf_document(parsed, file_meta)
 
+        # DOC (old binary Word format)
+        elif ext == ".doc":
+            text = self._parse_doc_file(file_path)
+            if text:
+                return self.chunker.chunk_text_document(text, file_meta)
+            return []
+
         # DOCX
         elif ext == ".docx":
             try:
@@ -628,3 +635,229 @@ class FileProcessor:
         # 其他
         else:
             return []
+
+    def _parse_doc_file(self, file_path: str) -> str:
+        """
+        解析旧版 .doc 文件 (OLE2 复合文档格式)
+        按优先级尝试多种后端:
+          1. win32com (Windows MS Word COM 自动化, 最可靠)
+          2. LibreOffice headless 转换
+          3. olefile 原始文本提取
+          4. antiword (Linux)
+          5. docx2txt / python-docx (仅对伪装的 .docx 有效)
+        """
+        # 方案1: Windows COM (MS Word 安装时最可靠)
+        text = self._parse_doc_via_win32(file_path)
+        if text and text.strip():
+            return text
+
+        # 方案2: LibreOffice headless 转换
+        text = self._parse_doc_via_libreoffice(file_path)
+        if text and text.strip():
+            return text
+
+        # 方案3: olefile 原始提取
+        text = self._parse_doc_via_olefile(file_path)
+        if text and text.strip():
+            return text
+
+        # 方案4: antiword (Linux)
+        text = self._parse_doc_via_antiword(file_path)
+        if text and text.strip():
+            return text
+
+        # 方案5: docx2txt / python-docx (某些 .doc 实际是 .docx 改名)
+        try:
+            import docx2txt
+            text = docx2txt.process(file_path)
+            if text and text.strip():
+                print(f"   [doc] docx2txt 解析成功: {len(text)} 字符")
+                return text
+        except Exception:
+            pass
+
+        try:
+            import docx
+            doc = docx.Document(file_path)
+            text = "\n".join([p.text for p in doc.paragraphs])
+            if text and text.strip():
+                print(f"   [doc] python-docx 解析成功: {len(text)} 字符")
+                return text
+        except Exception:
+            pass
+
+        print(f"   [warn] 所有 .doc 解析方案均失败: {os.path.basename(file_path)}")
+        print(f"   [tip] 建议方案: (1) pip install pywin32 启用 Word COM 解析")
+        print(f"         或 (2) 安装 LibreOffice")
+        print(f"         或 (3) 用 Word 打开后另存为 .docx 格式")
+        return ""
+
+    def _parse_doc_via_win32(self, file_path: str) -> str:
+        """
+        通过 Windows COM 调用 Microsoft Word 提取文本
+        这是 Windows 上解析 .doc 最可靠的方式
+        """
+        try:
+            import pythoncom
+            import win32com.client
+        except ImportError:
+            return ""
+
+        abs_path = os.path.abspath(file_path)
+        word = None
+        doc = None
+        try:
+            pythoncom.CoInitialize()
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = False
+            word.DisplayAlerts = 0
+
+            # 打开文档
+            doc = word.Documents.Open(abs_path, ReadOnly=True, Visible=False)
+
+            # 提取所有文本
+            text = doc.Content.Text
+
+            # 关闭文档
+            doc.Close(SaveChanges=False)
+
+            if text and text.strip():
+                print(f"   [doc] Word COM 解析成功: {len(text)} 字符")
+                return text
+
+        except Exception as e:
+            print(f"   [doc] Word COM 失败: {e}")
+            # 确保即使出错也尝试关闭文档
+            if doc is not None:
+                try:
+                    doc.Close(SaveChanges=False)
+                except Exception:
+                    pass
+        finally:
+            if word is not None:
+                try:
+                    word.Quit()
+                except Exception:
+                    pass
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+        return ""
+
+    def _parse_doc_via_libreoffice(self, file_path: str) -> str:
+        """通过 LibreOffice headless 将 .doc 转为文本"""
+        import subprocess
+        import tempfile
+
+        # 查找 LibreOffice 路径
+        lo_paths = [
+            "libreoffice", "soffice",
+            "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+            "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+            "/usr/bin/libreoffice", "/usr/bin/soffice",
+        ]
+
+        lo_exe = None
+        for p in lo_paths:
+            try:
+                subprocess.run([p, "--version"], capture_output=True, timeout=5)
+                lo_exe = p
+                break
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+
+        if not lo_exe:
+            return ""
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cmd = [
+                    lo_exe, "--headless", "--convert-to", "txt:Text",
+                    "--outdir", tmpdir, file_path,
+                ]
+                result = subprocess.run(cmd, capture_output=True, timeout=60)
+                if result.returncode == 0:
+                    # 查找生成的 txt 文件
+                    for f in os.listdir(tmpdir):
+                        if f.endswith(".txt"):
+                            txt_path = os.path.join(tmpdir, f)
+                            with open(txt_path, "r", encoding="utf-8", errors="ignore") as fp:
+                                text = fp.read()
+                            if text.strip():
+                                print(f"   [doc] LibreOffice 解析成功: {len(text)} 字符")
+                                return text
+        except Exception:
+            pass
+
+        return ""
+
+    def _parse_doc_via_olefile(self, file_path: str) -> str:
+        """通过 olefile 从 OLE2 容器中提取原始文本"""
+        try:
+            import olefile
+            ole = olefile.OleFileIO(file_path)
+
+            # 尝试读取 WordDocument 流中的文本
+            text_parts = []
+
+            # 读取主文本流
+            if ole.exists("WordDocument"):
+                data = ole.openstream("WordDocument").read()
+                # 尝试提取可读文本 (UTF-16 LE 编码的文本片段)
+                try:
+                    decoded = data.decode("utf-16-le", errors="ignore")
+                    # 过滤控制字符，保留可读内容
+                    import re
+                    readable = re.findall(r'[一-鿿　-〿＀-￯a-zA-Z0-9\s.,;:!?()（）、。，；：！？""''【】《》/-]+', decoded)
+                    if readable:
+                        text_parts.extend(readable)
+                except Exception:
+                    pass
+
+            # 尝试 1Table 或 0Table 流
+            for stream_name in ole.listdir():
+                stream_path = "/".join(stream_name) if isinstance(stream_name, list) else stream_name
+                if "Table" in stream_path or "Text" in stream_path:
+                    try:
+                        data = ole.openstream(stream_path).read()
+                        decoded = data.decode("utf-16-le", errors="ignore")
+                        import re
+                        readable = re.findall(r'[一-鿿]+', decoded)
+                        if readable:
+                            text_parts.extend(readable)
+                    except Exception:
+                        pass
+
+            ole.close()
+
+            if text_parts:
+                text = " ".join(text_parts)
+                print(f"   [doc] olefile 解析成功: {len(text)} 字符 (可能不完整)")
+                return text
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        return ""
+
+    def _parse_doc_via_antiword(self, file_path: str) -> str:
+        """通过 antiword 解析 (Linux)"""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["antiword", file_path],
+                capture_output=True, timeout=30,
+            )
+            if result.returncode == 0:
+                text = result.stdout.decode("utf-8", errors="ignore")
+                if text.strip():
+                    print(f"   [doc] antiword 解析成功: {len(text)} 字符")
+                    return text
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        return ""

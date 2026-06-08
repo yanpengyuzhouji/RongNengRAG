@@ -1,6 +1,107 @@
 # 开发日志
 
+## 2026-06-08
+
+### Qwen3 强制思考链优化 — 终极方案
+
+- **根因**: Qwen3 (4b/8b/14b) 和 DeepSeek-R1 是推理模型，强制生成 thinking tokens（占 85-95% 输出），`enable_thinking=false` 和 `disable_cot=true` 均对 Qwen3 无效
+- **方案演进**:
+  1. Ollama OpenAI兼容API `/v1/chat/completions` → reasoning 字段被 openai 库丢弃 → 改用原生 `/api/chat`
+  2. `disable_cot=true` 顶层参数 → Qwen3 不接受，反而更慢
+  3. `ollama create qwen3:4b-nothink` 自定义模板移除 think 标签 → 有效但只是隐藏，仍在生成
+  4. **最终方案**: 升级到 Ollama 最新版 + `qwen3.5:4b`，原生支持 `think: false` → 完全关闭思维链
+- **修改**: `ollama_provider.py` — 新增 `think` 参数，`payload["think"]=false` 关闭思考；流式直接输出无需缓冲
+- **预期效果**: 32k 上下文下 25-35 t/s，单次 RAG 问答 15-25 秒（vs qwen3:4b 的 70-90 秒）
+
+### LLM Provider 模式重构 + 百炼 API 支持
+
+- **新增** `src/generation/providers/` 包:
+  - `base.py` — `BaseProvider` 抽象基类 (`generate` + `generate_stream`)
+  - `ollama_provider.py` — 迁移原有 Ollama 逻辑到独立 Provider，改用原生 `/api/chat` 端点
+  - `bailian_provider.py` — 阿里云百炼 DashScope，OpenAI 兼容接口
+- **修改** `llm_engine.py` — 重构为 Provider 模式 facade，支持 `generate_chat()` 多轮对话 + `generate_chat_stream()` 流式
+- **修改** `config.py` — `load_config()` 自动加载 `.env` 环境变量
+- **新增** `.env.example` — API Key 模板
+
+### 多轮对话 + 上下文记忆系统
+
+- **新增** `src/generation/conversation_manager.py`:
+  - 会话管理: create/list/get/delete，每会话独立历史
+  - 压缩策略: 超窗口时保留最近 3 轮详细信息，旧消息压缩为摘要
+  - 所有时间戳使用北京时间 (Asia/Shanghai)
+- **修改** `api/main.py`:
+  - `AskRequest` 添加 `conversation_id` 字段
+  - 新增 `POST/GET/DELETE /conversations` CRUD 端点
+  - `/ask` 支持多轮上下文加载
+- **修改** `prompt_templates.py` — 新增 `get_system_prompt()` 系统提示词
+
+### SSE 流式生成 + 会话侧边栏 + 会话隔离
+
+- **修改** `api/main.py` — 新增 `POST /ask/stream` SSE 端点:
+  - 检索完成后立即发送 `searching` → `thinking` 心跳
+  - 模型产出 token 实时推送到前端
+- **修改** `ui/app.py` — 大幅重构:
+  - **新布局**: 左侧会话侧边栏 + 主区域 Chatbot
+  - 会话管理: 新建/切换/删除，`gr.State` 维护会话隔离
+  - 流式展示: 接收 SSE 事件实时更新 Chatbot
+  - 北京时间显示: 每条消息带时间戳
+  - 保留原有文件管理/检索/统计功能
+- **新增** API 流式心跳机制: thinking 阶段显示 "💭 思考中..." 动画
+
+### 检索置信度计算
+
+- **修改** `reranker.py` — 为每个结果附加 `_rerank_score` 并映射为 `confidence` (0-1)
+- **修改** `retriever.py` — `RetrievalResult` 新增 `confidence: float` 字段
+- **修改** `api/main.py` — `SearchResultItem` 新增 `confidence` 字段
+- **修改** `ui/app.py` — 搜索结果显示置信度百分比 + 可视化进度条
+- **修改** `config.yaml` — 新增 `retrieval.confidence` 配置
+
+### .doc 文件解析
+
+- **修改** `file_processor.py`:
+  - 新增 `_parse_doc_file()` 方法，按优先级: Word COM → LibreOffice → olefile → antiword → docx2txt
+  - 新增 `_parse_doc_via_win32()` — 通过 `win32com` 自动化本机 Word 提取文本
+  - `_parse_file()` 添加 `.doc` 分支
+- **效果**: 测试文件 "附件1福建省变配电工程消防设计技术要点.doc" → 37 chunks, 79,664 chars
+
+### 文件详情查看修复
+
+- **修改** `api/main.py` — 新增 `GET /files/{identifier}` 端点
+- **修改** `ui/app.py` — `view_file_details()` 直接调 API 查找，不再依赖过期缓存
+
+### 文档列表类目换行修复
+
+- **修改** `ui/app.py` `_build_file_tree()` — 每个类目标题前插入空行，避免 markdown 渲染连在一起
+
+### 文件管理标签页加载修复
+
+- **修改** `ui/app.py` — 文件管理/检索/统计 Tab 补齐 `demo.load` 事件，页面打开自动加载
+
+---
+
 ## 2026-06-05
+
+### 路径配置项目化
+
+- **新增** `src/config.py` — 统一配置加载模块
+  - 自动检测项目根目录（向上查找 `config.yaml`）
+  - 所有相对路径自动解析为绝对路径
+  - `ensure_data_dirs()` 自动创建数据目录
+  - `get_config_path()` 返回默认配置文件路径
+- **修改** `config.yaml` — 所有路径改为相对路径
+  - `knowledge_base: ""` 暂时留空，批量导入时再配置
+  - `metadata_db: "data/file_metadata.db"`
+  - `milvus_db: "data/milvus_lite.db"`
+  - `uploads_dir: "data/uploads"`
+  - `parsed_cache: "data/parsed_cache"`
+  - `models_dir: "data/models"`
+- **更新 8 个模块** — 全部改用 `from config import load_config`
+  - `milvus_store.py`, `embedder.py`, `file_processor.py`, `chunker.py`
+  - `file_walker.py`, `query_analyzer.py`, `reranker.py`, `retriever.py`
+  - `llm_engine.py` (llama_cpp 路径也改为项目相对)
+  - `api/main.py` (添加 startup 事件初始化数据目录)
+- **数据存储位置**: `D:/rag-system/` → 项目内 `data/`
+- **部署简化**: 克隆项目后无需创建外部目录或复制配置文件
 
 ### 文档与项目管理
 

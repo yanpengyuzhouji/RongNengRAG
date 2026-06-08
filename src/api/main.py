@@ -15,6 +15,7 @@ FastAPI 后端服务 — 榕能电力审图知识库 RAG API
 
 import sys
 import os
+import json
 import time
 import shutil
 from typing import Optional, List
@@ -22,7 +23,7 @@ from typing import Optional, List
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Form, Body, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -30,6 +31,7 @@ from pydantic import BaseModel, Field
 from ingestion.file_processor import FileProcessor, FileStatus, ProcessResult, BatchResult
 from retrieval.retriever import Retriever, SearchResponse, RetrievalResult
 from generation.llm_engine import LLMEngine
+from generation.conversation_manager import ConversationManager, beijing_now_display
 
 # ==== 应用初始化 ====
 app = FastAPI(
@@ -45,10 +47,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+async def startup():
+    """启动时初始化数据目录 + 预热模型"""
+    from config import ensure_data_dirs, load_config, get_project_root
+    cfg = load_config()
+    ensure_data_dirs(cfg)
+    print(f"[startup] 项目根目录: {get_project_root()}")
+    print(f"[startup] 数据目录: {cfg['paths']['uploads_dir']}")
+    print(f"[startup] 向量库路径: {cfg['paths']['milvus_db']}")
+
+    # 预热嵌入模型和重排序模型(避免首次请求等待)
+    import threading
+    def warmup():
+        print("[startup] 预热嵌入模型...")
+        try:
+            e = get_retriever()
+            _ = e.embedder.encode_query("预热测试")
+            print("[startup] 嵌入+重排序模型预热完成")
+        except Exception as ex:
+            print(f"[startup] 模型预热跳过: {ex}")
+    threading.Thread(target=warmup, daemon=True).start()
+
 # 全局实例 (延迟加载)
 _processor: FileProcessor = None
 _retriever: Retriever = None
 _llm: LLMEngine = None
+_conv_mgr: ConversationManager = None
 
 
 def get_processor() -> FileProcessor:
@@ -73,6 +99,13 @@ def get_llm():
         except Exception:
             _llm = None
     return _llm
+
+
+def get_conv_mgr():
+    global _conv_mgr
+    if _conv_mgr is None:
+        _conv_mgr = ConversationManager()
+    return _conv_mgr
 
 
 # ===== Pydantic 模型 =====
@@ -111,6 +144,7 @@ class SearchResultItem(BaseModel):
     chunk_id: str
     text: str
     score: float
+    confidence: float
     domain: str
     category: str
     file_path: str
@@ -134,6 +168,7 @@ class AskRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(default=15, ge=5, le=30)
     domain_filter: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 
 class AskResponse(BaseModel):
@@ -337,6 +372,17 @@ async def add_files_from_paths(
 
 # ===== 文件管理端点 =====
 
+@app.get("/files/{identifier}")
+async def get_file_detail(identifier: str):
+    """获取单个文件详情 (按 hash 或文件名查找)"""
+    processor = get_processor()
+    files = processor.list_files(limit=1000)
+    for f in files:
+        if f.get("file_hash") == identifier or f.get("file_name") == identifier:
+            return f
+    raise HTTPException(status_code=404, detail="文件未找到")
+
+
 @app.delete("/files/{identifier}")
 async def delete_file(identifier: str):
     """删除已入库文件 (从向量库中移除)"""
@@ -413,7 +459,8 @@ async def search(req: SearchRequest):
         results.append(SearchResultItem(
             rank=i + 1, chunk_id=item.chunk_id,
             text=item.text[:500] + ("..." if len(item.text) > 500 else ""),
-            score=item.score, domain=item.domain, category=item.category,
+            score=item.score, confidence=item.confidence,
+            domain=item.domain, category=item.category,
             file_path=item.file_path, doc_number=item.doc_number,
             voltage_level=item.voltage_level, publish_level=item.publish_level,
             page_num=item.page_num,
@@ -432,13 +479,51 @@ async def ask(req: AskRequest):
     resp = r.search(query=req.query, top_k=req.top_k, domain_filter=req.domain_filter)
 
     if not resp.results:
-        return AskResponse(query=req.query, answer="未找到相关内容", citations=[], sources=[],
+        answer = "未找到相关内容"
+        # 仍然记录到会话
+        if req.conversation_id:
+            conv_mgr = get_conv_mgr()
+            conv_mgr.add_message(req.conversation_id, "user", req.query)
+            conv_mgr.add_message(req.conversation_id, "assistant", answer)
+        return AskResponse(query=req.query, answer=answer, citations=[], sources=[],
                           elapsed_ms=(time.time() - t0) * 1000)
 
     context = r.format_context_for_llm(resp.results, max_chunks=req.top_k)
     llm = get_llm()
 
-    if llm:
+    # 多轮对话: 使用完整历史消息
+    if req.conversation_id and llm:
+        conv_mgr = get_conv_mgr()
+        conv_mgr.add_message(req.conversation_id, "user", req.query)
+
+        try:
+            # 获取历史上下文消息
+            history_msgs = conv_mgr.get_context_messages(req.conversation_id)
+
+            # 构建消息列表: 系统提示 + 历史 + 当前检索上下文
+            from generation.prompt_templates import get_system_prompt
+            messages = [{"role": "system", "content": get_system_prompt(resp.query_type)}]
+
+            # 添加历史消息 (不包含刚添加的用户消息的最后一条)
+            for hm in history_msgs[:-1]:
+                messages.append(hm)
+
+            # 最后一条用户消息附带检索上下文
+            messages.append({
+                "role": "user",
+                "content": f"参考资料:\n{context}\n\n用户问题: {req.query}\n\n请回答:"
+            })
+
+            answer = llm.generate_chat(messages, temperature=0.1)
+            citations = llm.extract_citations(answer)
+        except Exception as e:
+            answer = f"⚠ LLM 不可用: {e}\n\n检索到 {resp.total_candidates} 条"
+            citations = []
+
+        # 记录助手回复
+        conv_mgr.add_message(req.conversation_id, "assistant", answer, citations=citations)
+
+    elif llm:
         try:
             answer = llm.generate_rag_answer(query=req.query, context=context,
                                             query_type=resp.query_type)
@@ -463,6 +548,149 @@ async def ask(req: AskRequest):
 
     return AskResponse(query=req.query, answer=answer, citations=citations,
                       sources=sources, elapsed_ms=(time.time() - t0) * 1000)
+
+
+# ===== 流式问答端点 =====
+
+@app.post("/ask/stream")
+async def ask_stream(req: AskRequest):
+    """SSE 流式 RAG 问答 (同步生成器, 避免 async 事件循环缓冲)"""
+    from fastapi.responses import StreamingResponse
+
+    def generate():
+        t0 = time.time()
+
+        # === 阶段0: 发送连接成功心跳 ===
+        yield f"data: {json.dumps({'status': 'searching', 'done': False})}\n\n"
+
+        r = get_retriever()
+        resp = r.search(query=req.query, top_k=req.top_k, domain_filter=req.domain_filter)
+
+        if not resp.results:
+            yield f"data: {json.dumps({'token': '未找到相关内容', 'done': True, 'citations': [], 'sources': [], 'elapsed_ms': (time.time() - t0) * 1000})}\n\n"
+            return
+
+        context = r.format_context_for_llm(resp.results, max_chunks=req.top_k)
+        llm = get_llm()
+
+        if not llm:
+            yield f"data: {json.dumps({'token': '⚠ LLM 未部署', 'done': True})}\n\n"
+            return
+
+        # 构建 sources
+        sources = []
+        seen = set()
+        for item in resp.results[:10]:
+            k = item.file_path
+            if k not in seen:
+                seen.add(k)
+                sources.append({"file_path": k, "doc_number": item.doc_number,
+                               "domain": item.domain, "category": item.category})
+
+        try:
+            # === 阶段1: 检索完成, 立即发心跳通知前端"思考中" ===
+            yield f"data: {json.dumps({'status': 'thinking', 'done': False, 'sources_count': len(sources)})}\n\n"
+
+            if req.conversation_id:
+                conv_mgr = get_conv_mgr()
+                conv_mgr.add_message(req.conversation_id, "user", req.query)
+
+                from generation.prompt_templates import get_system_prompt
+                history_msgs = conv_mgr.get_context_messages(req.conversation_id)
+                messages = [{"role": "system", "content": get_system_prompt(resp.query_type)}]
+                for hm in history_msgs[:-1]:
+                    messages.append(hm)
+                messages.append({
+                    "role": "user",
+                    "content": f"参考资料:\n{context}\n\n用户问题: {req.query}\n\n请回答:"
+                })
+
+                full_answer = ""
+                for token in llm.generate_chat_stream(messages, temperature=0.1):
+                    full_answer += token
+                    yield f"data: {json.dumps({'token': token, 'done': False})}\n\n"
+
+                citations = llm.extract_citations(full_answer)
+                conv_mgr.add_message(req.conversation_id, "assistant", full_answer, citations=citations)
+
+                yield f"data: {json.dumps({'token': '', 'done': True, 'citations': citations, 'sources': sources, 'elapsed_ms': (time.time() - t0) * 1000, 'full_answer': full_answer})}\n\n"
+            else:
+                full_answer = ""
+                for token in llm.generate_rag_answer_stream(
+                    query=req.query, context=context, query_type=resp.query_type
+                ):
+                    full_answer += token
+                    yield f"data: {json.dumps({'token': token, 'done': False})}\n\n"
+
+                citations = llm.extract_citations(full_answer)
+                yield f"data: {json.dumps({'token': '', 'done': True, 'citations': citations, 'sources': sources, 'elapsed_ms': (time.time() - t0) * 1000, 'full_answer': full_answer})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'token': f'⚠ 错误: {e}', 'done': True})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Content-Encoding": "identity",  # 禁用压缩防止缓冲
+        },
+    )
+
+
+# ===== 多轮对话端点 =====
+
+class ConversationCreateRequest(BaseModel):
+    title: str = ""
+
+
+class ConversationResponse(BaseModel):
+    conv_id: str
+    title: str
+    created_at: str
+    updated_at: str
+    message_count: int
+
+
+@app.post("/conversations")
+async def create_conversation(payload: dict = Body(default=None)):
+    """创建新会话 (可选 JSON body: {"title": "..."})"""
+    conv_mgr = get_conv_mgr()
+    title = ""
+    if payload and isinstance(payload, dict):
+        title = payload.get("title", "")
+    conv_id = conv_mgr.create_conversation(title=title)
+    conv = conv_mgr.get_conversation(conv_id)
+    return conv
+
+
+@app.get("/conversations")
+async def list_conversations():
+    """列出所有会话"""
+    conv_mgr = get_conv_mgr()
+    return conv_mgr.list_conversations()
+
+
+@app.get("/conversations/{conv_id}")
+async def get_conversation(conv_id: str):
+    """获取会话详情 (含消息历史)"""
+    conv_mgr = get_conv_mgr()
+    conv = conv_mgr.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return conv
+
+
+@app.delete("/conversations/{conv_id}")
+async def delete_conversation(conv_id: str):
+    """删除会话"""
+    conv_mgr = get_conv_mgr()
+    ok = conv_mgr.delete_conversation(conv_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"status": "deleted", "conv_id": conv_id}
 
 
 if __name__ == "__main__":

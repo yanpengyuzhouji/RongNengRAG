@@ -4,17 +4,19 @@
 
 ### 1.1 整体架构
 
-系统采用前后端分离 + HTTP API 架构：
+系统采用前后端分离 + SSE 流式 + 多轮对话架构：
 
 ```
 浏览器 (Gradio UI :7860)
-    │  HTTP/1.1 JSON
+    │  SSE Stream + HTTP JSON
     ▼
 FastAPI (:8000)
     │
     ├── FileProcessor ──→ Chunker + Embedder + MilvusStore
     ├── Retriever     ──→ QueryAnalyzer + Embedder + MilvusStore + Reranker
-    └── LLMEngine     ──→ Ollama API (:11434)
+    ├── LLMEngine     ──→ Provider (Ollama/Bailian)
+    │                      └── Ollama /api/chat (:11434)
+    └── ConversationManager ──→ 多轮对话 + 上下文压缩
 ```
 
 ### 1.2 关键设计决策
@@ -22,10 +24,14 @@ FastAPI (:8000)
 | 决策 | 原因 |
 |------|------|
 | Gradio 作为 HTTP 客户端 | Milvus Lite 仅支持单进程，Gradio 不直接操作数据库 |
-| Ollama 本地模型 | 无需外网，数据不出内网，CUDA 加速 |
-| 嵌入式向量库 (Milvus Lite) | 无需 Docker，零配置部署 |
+| Ollama 原生 `/api/chat` | OpenAI 兼容接口丢弃 Qwen3 thinking 字段 |
+| Provider 模式 | Ollama/百炼/llama-cpp 后端解耦，一键切换 |
+| Qwen3.5 + think:false | 推理模型思维链占 85% token，关闭后提速 10 倍 |
+| SSE 流式生成 | token 级实时推送 + 心跳防超时 |
+| 会话侧边栏 + 隔离 | 每会话独立历史，自动压缩超窗口消息 |
+| BGE-M3 稠密+稀疏混合检索 | 原生稀疏向量，解决关键词匹配差的问题 |
 | 三阶段检索 (分析→召回→精排) | 兼顾召回率和准确率 |
-| 延迟加载模型 | 减少冷启动内存占用 |
+| 延迟加载 + 启动预热 | 减少冷启动内存，启动时预加载嵌入模型 |
 
 ## 2. 模块详解
 
@@ -37,24 +43,24 @@ FastAPI (:8000)
 
 | 后端 | 模式 | 使用场景 |
 |------|------|----------|
-| Ollama | `provider: "ollama"` | 默认，调用 `/api/embed` 批量嵌入 |
-| Sentence Transformers | `provider: "sentence_transformers"` | HuggingFace 直接加载（需联网） |
+| Sentence Transformers | `provider: "sentence_transformers"` | 默认，本地 GPU 加载 BGE-M3 |
+| Ollama | `provider: "ollama"` | 调用 `/api/embed` 批量嵌入 |
 
 **API**:
 
 ```python
 embedder = Embedder()
 
-# 批量嵌入
+# 批量嵌入 (稠密 + 稀疏)
 result = embedder.encode(texts, show_progress=True)
 # result.dense_vectors: List[List[float]]  稠密向量 (1024 维)
-# result.sparse_vectors: List[dict]         稀疏向量 (Ollama 返回空)
+# result.sparse_vectors: List[dict]         BGE-M3 原生稀疏向量
 
 # 单查询嵌入
 dense_vec, sparse_vec = embedder.encode_query("变电消防要求")
 ```
 
-**模型**: `bge-m3:latest` (1024 维稠密向量)，运行在 GPU (RTX 4070 SUPER) 上。
+**模型**: `BAAI/bge-m3` (1024 维稠密 + 原生稀疏)，运行在 GPU (RTX 4070 SUPER) 上。
 
 ### 2.2 向量数据库 (`ingestion/milvus_store.py`)
 
@@ -134,16 +140,19 @@ retrieval:
 
 | 模式 | 算法 | 配置 |
 |------|------|------|
-| Ollama | 用 BGE-M3 嵌入 query + 候选文本 → 余弦相似度 | `provider: "ollama"` |
 | FlagEmbedding | BGE-Reranker-v2-m3 交叉编码器 | `provider: "flagembedding"` |
+| Ollama | 用 BGE-M3 嵌入 query + 候选文本 → 余弦相似度 | `provider: "ollama"` |
 
-**元数据加权** (Ollama 和 FlagEmbedding 通用):
-- 文档编号精确匹配: ×1.5
-- 标准规范类目: ×1.2
-- 国标/行标: ×1.1
-- 域精确匹配: ×1.1
-- 电压等级匹配: ×1.15
+**元数据加权** (两种模式通用):
+- 文件名匹配: ×1.30
+- 文档编号精确匹配: ×1.05
+- 标准规范类目: ×1.05
+- 国标/行标: ×1.05
+- 域精确匹配: ×1.05
+- 电压等级匹配: ×1.10
 - 图纸 (非查图查询): ×0.85
+
+**置信度校准**: 每个结果附带 `confidence` (0-1)，基于 rerank 分数 min-max 归一化。
 
 ### 2.6 文件处理器 (`ingestion/file_processor.py`)
 
@@ -155,6 +164,7 @@ process(file_path, domain, category)
     ├─ Step 1: 解析 (parse_time_ms)
     │   _build_file_meta() → _parse_file()
     │   ├─ PDF: PDFParser → Chunker
+    │   ├─ DOC: Word COM (win32com) → LibreOffice → olefile → antiword
     │   ├─ DOCX: python-docx → Chunker
     │   ├─ XLSX: openpyxl → Chunker
     │   └─ TXT/MD: 直接读取 → Chunker
@@ -168,33 +178,68 @@ process(file_path, domain, category)
 
 **去重**: 基于 SHA-256 文件哈希，`file_metadata.db` 中记录状态，已入库文件自动跳过。
 
+**.doc 解析**: 通过 `win32com.client.Dispatch("Word.Application")` 自动化本机 Word（Windows），大幅提升旧版 .doc 文件解析成功率。
+
 ### 2.7 LLM 推理引擎 (`generation/llm_engine.py`)
 
-**类**: `LLMEngine`
+**类**: `LLMEngine` — Provider 模式 facade
 
 **后端**:
-- Ollama: 通过 OpenAI 兼容 API (`/v1/chat/completions`)
-- llama-cpp-python: 直接加载 GGUF 模型文件
+| Provider | 接口 | 说明 |
+|----------|------|------|
+| Ollama | 原生 `/api/chat` | 默认，支持 think:false 关闭思维链 |
+| Bailian | 阿里云百炼 DashScope | OpenAI 兼容，需 `DASHSCOPE_API_KEY` |
+| llama-cpp | 直接加载 GGUF | 备选方案 |
+
+**Provider 架构** (`generation/providers/`):
+```
+LLMEngine (facade)
+   └── BaseProvider (抽象)
+        ├── OllamaProvider  → Ollama /api/chat
+        └── BailianProvider → DashScope /v1/chat/completions
+```
 
 **提示词模板** (`generation/prompt_templates.py`):
+- `specification_lookup`: 精确数值查规
 - `domain_technical`: 专业问答 (强调引用来源、区分标准层级、标注强制性)
 - `document_lookup`: 结构化文档摘要
-- `cross_domain_comparison`: 跨域对比分析 (表格对比)
-- `specification_lookup`: 精确数值查规
+- `cross_domain_comparison`: 跨域对比分析
 - `general_qa`: 通用问答
+- `SYSTEM_PROMPT_CHAT`: 多轮对话系统提示 (直接回答，不输出思考过程)
 
-### 2.8 Gradio UI (`ui/app.py`)
+### 2.8 对话管理 (`generation/conversation_manager.py`)
 
-HTTP 客户端模式，所有操作通过 FastAPI 完成:
+**类**: `ConversationManager`
 
-| UI 功能 | API 调用 |
-|---------|----------|
-| 智能问答 | `POST /ask` |
-| 文档检索 | `POST /search` |
-| 上传入库 | `POST /upload` |
-| 文件管理 | `GET /files` + `DELETE /files/{id}` |
-| 入库统计 | `GET /files/summary` |
-| 选择性删除 | 下拉选择文件 → `DELETE /files/{id}` → 自动刷新列表 |
+- 内存存储 + 日后可迁移 SQLite
+- 自动压缩: 超过 `max_context_tokens * 0.85` 时，旧消息合并为摘要
+- 保留最近 `keep_detail_rounds=3` 轮完整内容
+- 所有时间戳使用北京时间 `Asia/Shanghai`
+
+### 2.9 Gradio UI (`ui/app.py`)
+
+**v3.0 重构** — 聊天界面 + 会话管理:
+
+```
+┌──────────┬──────────────────────────────────┐
+│ 侧边栏    │ 主区域                            │
+│          │                                  │
+│ [+ 新建] │  Chatbot (gr.Chatbot type=messages)│
+│ ──────── │                                  │
+│ 会话1    │  user: 提问...                    │
+│ 会话2    │  assistant: 回答...               │
+│ 会话3    │  [2026-06-08 16:30 北京时间]      │
+│          │                                  │
+│          │  [输入框________________] [发送]  │
+└──────────┴──────────────────────────────────┘
+```
+
+**核心功能**:
+- **流式问答**: SSE → `gr.Chatbot` generator，实时 token 展示
+- **会话隔离**: `gr.State` 维护 `conversation_id`，每会话独立上下文
+- **心跳动画**: 检索/thinking 阶段显示 "🔍 检索中..." / "💭 思考中..."
+- **会话管理**: 新建/切换/删除，API CRUD
+- **文件管理**: 保留原 Tab（入库/检索/统计）
 
 ## 3. API 接口文档
 
@@ -269,20 +314,44 @@ HTTP 客户端模式，所有操作通过 FastAPI 完成:
 {
   "query": "变电消防设计要求有哪些？",
   "top_k": 15,
-  "domain_filter": null
+  "domain_filter": null,
+  "conversation_id": "abc123"  // 可选, 多轮对话
 }
 
 // Response:
 {
   "query": "变电消防设计要求有哪些？",
-  "answer": "根据检索到的高级标准规范，变电消防设计要求主要包括...【GB 50060-2008 第X条】",
+  "answer": "根据检索到的高级标准规范...【GB 50060-2008 第X条】",
   "citations": ["GB 50060-2008 第X条", "DL/T 5352-2018"],
-  "sources": [
-    {"file_path": "...", "doc_number": "GB 50060-2008", "domain": "变电", "category": "标准规范"}
-  ],
+  "sources": [...],
   "elapsed_ms": 28519.0
 }
 ```
+
+### POST /ask/stream
+
+SSE 流式端点，token 级实时推送:
+
+```
+data: {"status":"searching"}          // 检索中
+data: {"status":"thinking"}           // 模型思考中
+data: {"token":"变电","done":false}   // 流式 token
+data: {"token":"","done":true,"citations":[...],"full_answer":"..."}  // 完成
+```
+
+### POST /conversations
+
+```json
+// Request:
+{"title": "变电消防规范咨询"}
+
+// Response:
+{"conv_id":"abc123","title":"...","created_at":"2026-06-08T...","message_count":0}
+```
+
+### GET/DELETE /conversations/{conv_id}
+
+获取会话历史(含完整消息列表) 或 删除会话。
 
 ## 4. 数据流
 
@@ -366,49 +435,40 @@ Retriever.search(query, top_k)
 
 ## 5. 部署配置
 
-### 5.1 配置文件路径
+### 5.1 配置文件
 
-所有模块默认从 `D:/rag-system/config.yaml` 读取配置。运行前需将项目根目录的 `config.yaml` 复制到该路径。
+`config.yaml` 位于项目根目录，所有路径相对解析。
 
 ### 5.2 模型运行位置
 
-| 模型 | 运行位置 | 方式 |
+| 模型 | 运行位置 | 说明 |
 |------|----------|------|
-| bge-m3:latest | GPU | Ollama 自动分配到 CUDA |
-| qwen3:8b | GPU | Ollama 自动分配到 CUDA |
+| BAAI/bge-m3 | GPU (sentence_transformers) | 稠密+稀疏嵌入 |
+| BAAI/bge-reranker-v2-m3 | GPU (FlagEmbedding) | 交叉编码器精排 |
+| qwen3.5:4b | GPU (Ollama) | LLM 问答，think=false 关闭思考链 |
+| bge-m3:latest | GPU (Ollama) | Ollama 备用嵌入 |
 
 ### 5.3 数据存储
 
 | 路径 | 内容 |
 |------|------|
-| `D:/rag-system/data/milvus_lite.db/` | Milvus Lite 向量数据 (LMDB) |
-| `D:/rag-system/data/file_metadata.db` | SQLite 文件注册表 |
-| `D:/rag-system/data/uploads/` | 上传文件暂存 |
-| `D:/rag-system/data/parsed_cache/` | 解析缓存 |
-| `D:/rag-system/config.yaml` | 运行时配置 |
-
-### 5.4 从 Milvus Lite 迁移到 Milvus Standalone
-
-当需要多进程共享或更高并发时:
-
-```python
-# 当前 (Lite)
-client = MilvusClient("D:/rag-system/data/milvus_lite.db")
-
-# 迁移到 Docker Standalone
-client = MilvusClient(uri="http://localhost:19530")
-```
-
-Schema 和 API 完全兼容，无需修改业务代码。
+| `data/milvus_lite.db/` | Milvus Lite 向量数据 (LMDB) |
+| `data/file_metadata.db` | SQLite 文件注册表 |
+| `data/uploads/` | 上传文件暂存 |
+| `data/parsed_cache/` | 解析缓存 |
+| `config.yaml` | 运行时配置 |
+| `.env` | API Key (不入 git) |
+| `.env.example` | API Key 模板 |
 
 ## 6. 性能参数
 
 | 参数 | 值 |
 |------|-----|
-| 嵌入维度 | 1024 (BGE-M3) |
+| 嵌入维度 | 1024 (BGE-M3 稠密) + 原生稀疏 |
 | 单次嵌入耗时 | ~7s / 16 chunks (GPU) |
-| 检索耗时 | ~6s (含嵌入+搜索+重排) |
-| 问答总耗时 | ~28s (含检索+LLM生成) |
-| 单文件入库 | ~8s (含解析+嵌入+入库) |
+| 检索耗时 | ~3s (QueryAnalyze+HybridSearch+Rerank) |
+| 问答总耗时 | ~20-30s (qwen3.5:4b think=false + 32k ctx) |
+| LLM token/s | ~25-35 t/s (32k 上下文) |
 | 粗召回候选数 | 50 |
 | 精排结果数 | 15 (可配置) |
+| GPU | NVIDIA RTX 4070 SUPER (12GB) |

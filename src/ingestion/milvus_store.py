@@ -5,7 +5,6 @@ Milvus Lite 向量数据库 — Schema 创建 + 批量入库
 
 import os
 import time
-import yaml
 from pymilvus import (
     MilvusClient, DataType, Function, AnnSearchRequest, RRFRanker
 )
@@ -45,9 +44,9 @@ class MilvusStore:
     COLLECTION_NAME = "power_design_chunks"
     DENSE_DIM = 1024  # BGE-M3 稠密向量维度
 
-    def __init__(self, config_path: str = "D:/rag-system/config.yaml"):
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self, config_path: str = None):
+        from config import load_config
+        self.config = load_config(config_path)
 
         self.db_path = self.config["paths"]["milvus_db"]
         self.client = self._connect()
@@ -108,22 +107,15 @@ class MilvusStore:
             schema=schema,
         )
 
-        # Step 2: 逐个创建索引（尽力而为，milvus-lite 默认 FLAT 无需索引也能搜索）
-        index_defs = [
-            ("dense_vector", "IVF_FLAT", "COSINE", {"nlist": 1024}),
+        # Step 2: 创建索引（仅向量字段创建索引，标量字段 FLAT 搜索即可）
+        # pymilvus 3.0 create_index 对 WAL 集合需要特殊处理
+        for field_name, index_type, metric_type, params in [
+            ("dense_vector", "FLAT", "COSINE", None),
             ("sparse_vector", "SPARSE_INVERTED_INDEX", "IP", None),
-            ("domain", "TRIE", None, None),
-            ("category", "TRIE", None, None),
-            ("voltage_level", "TRIE", None, None),
-            ("publish_level", "TRIE", None, None),
-            ("year", "STL_SORT", None, None),
-        ]
-        for field, idx_type, metric, params in index_defs:
+        ]:
             try:
                 idx = self.client.prepare_index_params()
-                kwargs = {"field_name": field, "index_type": idx_type}
-                if metric:
-                    kwargs["metric_type"] = metric
+                kwargs = {"field_name": field_name, "index_type": index_type, "metric_type": metric_type}
                 if params:
                     kwargs["params"] = params
                 idx.add_index(**kwargs)
@@ -132,7 +124,7 @@ class MilvusStore:
                     index_params=idx,
                 )
             except Exception:
-                pass  # milvus-lite Windows bug: os.rename 失败，不影响 FLAT 搜索
+                pass  # 索引创建失败不影响功能
 
         print(f"[OK] 集合创建完成: {self.COLLECTION_NAME}")
 

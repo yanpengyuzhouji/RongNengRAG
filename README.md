@@ -7,14 +7,14 @@
 | 层次 | 技术 |
 |------|------|
 | 向量数据库 | Milvus Lite (内嵌式，无需 Docker) |
-| 嵌入模型 | BGE-M3 (`bge-m3:latest`，通过 Ollama 本地部署) |
-| LLM | Qwen3 8B (`qwen3:8b`，通过 Ollama API 调用) |
-| 重排序 | 嵌入余弦相似度 + 元数据加权 (Ollama) |
-| 后端 API | FastAPI + Pydantic v2 |
-| 前端 UI | Gradio 5.x (HTTP 客户端模式) |
-| 文档解析 | PyMuPDF (PDF)、python-docx (DOCX)、python-pptx (PPTX)、openpyxl (XLSX) |
-| OCR | PaddleOCR (可选，扫描件识别) |
-| GPU 加速 | CUDA (RTX 4070 SUPER)，Ollama 自动调用 |
+| 嵌入模型 | BAAI/bge-m3 (本地 sentence_transformers，稠密+稀疏) |
+| 重排序 | BAAI/bge-reranker-v2-m3 (FlagEmbedding 交叉编码器) |
+| LLM | Qwen3.5 4B (`qwen3.5:4b`，Ollama，think=false 关闭思考链) |
+| 后端 API | FastAPI + Pydantic v2 + SSE 流式 |
+| 前端 UI | Gradio 5.x (Chatbot 流式 + 会话侧边栏) |
+| 文档解析 | PyMuPDF (PDF)、win32com (DOC)、python-docx (DOCX)、openpyxl (XLSX) |
+| 多轮对话 | ConversationManager (上下文压缩 + 会话隔离) |
+| API Key | .env 管理 (不入 git)，支持阿里云百炼 |
 
 ## 快速开始
 
@@ -37,13 +37,12 @@ pip install -r requirements.txt
 # 3. 安装 Milvus Lite 内嵌引擎
 pip install milvus-lite
 
-# 4. 拉取 Ollama 模型
-ollama pull bge-m3:latest          # 嵌入模型
-ollama pull qwen3:8b                # 问答模型 (或其他 Qwen 系列)
+# 4. 拉取 Ollama 模型 (Ollama 需更新到最新版)
+ollama pull bge-m3:latest          # 嵌入模型 (Ollama备用)
+ollama pull qwen3.5:4b             # 问答模型 (支持 think=false 关闭思考链)
 
-# 5. 创建数据目录
-mkdir -p D:/rag-system/data/uploads D:/rag-system/data/parsed_cache D:/rag-system/models
-cp config.yaml D:/rag-system/config.yaml
+# 5. 项目自带 config.yaml，首次启动自动创建 data/ 目录
+#    无需手动创建路径
 ```
 
 ### 启动
@@ -80,57 +79,65 @@ python scripts/build_index.py summary
 ```
 RongNengRAG/
 ├── config.yaml                  # 主配置文件
-├── requirements.txt             # Python 依赖
+├── requirements.txt
+├── .env.example                 # API Key 模板
 ├── README.md                    # 本文件
 ├── CHANGELOG.md                 # 开发日志
 ├── TECHNICAL.md                 # 技术文档
 ├── scripts/
-│   └── build_index.py           # 命令行索引工具 (add-file/add-dir/list/delete/reindex)
+│   └── build_index.py           # 命令行索引工具
 └── src/
     ├── api/
-    │   └── main.py              # FastAPI 后端 (REST API + 文件管理)
+    │   └── main.py              # FastAPI (REST + SSE + 多轮对话)
     ├── ui/
-    │   └── app.py               # Gradio 前端 (HTTP 客户端，不直接操作 DB)
-    ├── ingestion/               # 数据入库管道
-    │   ├── file_processor.py    # 文件处理编排器 (parse→chunk→embed→insert)
-    │   ├── file_walker.py       # 知识库目录遍历 + 元数据提取
-    │   ├── chunker.py           # 格式感知分块引擎 (语义/单页/全文)
-    │   ├── embedder.py          # 嵌入引擎 (Ollama BGE-M3)
-    │   ├── milvus_store.py      # Milvus Lite 向量库封装
-    │   └── pdf_parser.py        # PDF 文本提取 (PyMuPDF)
+    │   └── app.py               # Gradio v3.0 (Chatbot + 会话侧边栏)
+    ├── ingestion/               # 数据入库
+    │   ├── file_processor.py    # 文件处理编排器 (.doc Word COM解析)
+    │   ├── file_walker.py       # 知识库遍历 + 元数据提取
+    │   ├── chunker.py           # 格式感知分块引擎
+    │   ├── embedder.py          # BGE-M3 稠密+稀疏嵌入
+    │   ├── milvus_store.py      # Milvus Lite 向量库
+    │   └── pdf_parser.py        # PDF 文本提取
     ├── retrieval/               # 检索管道
-    │   ├── retriever.py         # 三阶段检索编排器 (分析→召回→精排)
-    │   ├── query_analyzer.py    # 查询分析器 (域分类+参数提取+同义词扩展)
-    │   └── reranker.py          # 重排序器 (嵌入相似度+元数据加权)
+    │   ├── retriever.py         # 三阶段检索 + 置信度
+    │   ├── query_analyzer.py    # 查询分析器
+    │   └── reranker.py          # 交叉编码器精排 + 元数据加权
     └── generation/              # 回答生成
-        ├── llm_engine.py        # LLM 推理引擎 (Ollama/llama.cpp)
-        └── prompt_templates.py  # 领域提示词模板
+        ├── llm_engine.py        # LLM Engine (Provider模式)
+        ├── prompt_templates.py  # 领域提示词 + 系统提示
+        ├── conversation_manager.py  # 多轮对话 + 上下文压缩
+        └── providers/           # LLM Provider
+            ├── base.py
+            ├── ollama_provider.py   # Ollama 原生 /api/chat
+            └── bailian_provider.py  # 阿里云百炼
 ```
 
 ## 架构概览
 
 ```
                      ┌──────────────┐
-                     │   Gradio UI  │  (浏览器交互)
+                     │  Gradio UI   │  (Chatbot + 会话侧边栏)
                      │  :7860       │
                      └──────┬───────┘
-                            │ HTTP API 调用
+                            │ SSE Stream + HTTP
                      ┌──────▼───────┐
                      │   FastAPI    │  (后端服务)
                      │  :8000       │
                      └──┬───┬───┬──┘
-          ┌─────────────┘   │   └─────────────┐
-          ▼                 ▼                 ▼
-   ┌──────────────┐  ┌──────────┐   ┌──────────────┐
-   │ FileProcessor│  │ Retriever│   │  LLMEngine   │
-   │ (入库管道)    │  │ (检索管道)│   │  (Ollama)    │
-   └──────┬───────┘  └────┬─────┘   └──────────────┘
-          │               │
-          ▼               ▼
-   ┌──────────────┐  ┌──────────┐
-   │ Milvus Lite  │  │ Embedder │
-   │ (向量库)     │  │ (BGE-M3) │
-   └──────────────┘  └──────────┘
+          ┌─────────────┘   │   └──────────────┐
+          ▼                 ▼                  ▼
+   ┌──────────────┐  ┌──────────┐   ┌──────────────────┐
+   │ FileProcessor│  │ Retriever│   │   LLMEngine      │
+   │ (入库管道)    │  │ (3-stage)│   │ (Provider模式)    │
+   └──────┬───────┘  └────┬─────┘   └────────┬─────────┘
+          │               │                  │
+          ▼               ▼                  ▼
+   ┌──────────────┐  ┌──────────┐   ┌──────────────────┐
+   │ Milvus Lite  │  │ Embedder │   │ OllamaProvider   │
+   │ (向量库)     │  │ (BGE-M3) │   │ /api/chat        │
+   └──────────────┘  └──────────┘   │ BailianProvider  │
+                                    │ /v1/chat/...     │
+                                    └──────────────────┘
 ```
 
 ## 检索管道
@@ -190,10 +197,10 @@ LLM 生成回答 (带引用来源)
 `config.yaml` 包含：
 - **路径配置**: 知识库目录、数据库路径、模型目录
 - **域配置**: 变电/配电/送电输电/综合的类目树
-- **嵌入配置**: 选择 `ollama` 或 `sentence_transformers` 作为嵌入后端
-- **重排序配置**: 选择 `ollama` (相似度) 或 `flagembedding` (交叉编码器)
-- **LLM 配置**: 选择 `ollama` 或 `llama_cpp` 作为推理后端
-- **检索参数**: RRF 融合参数、粗召回数、精排数
+- **嵌入配置**: BGE-M3 本地 GPU 或 Ollama 回退
+- **重排序配置**: FlagEmbedding 交叉编码器 或 嵌入相似度
+- **LLM 配置**: Ollama / 百炼 / llama-cpp，`think: false` 关闭 Qwen3.5 思考链
+- **检索参数**: RRF 融合、粗召回数、精排数、置信度校准
 
 ## API 端点
 
@@ -206,8 +213,11 @@ LLM 生成回答 (带引用来源)
 | POST | `/upload` | 单文件上传入库 |
 | POST | `/upload/batch` | 批量上传入库 |
 | GET | `/files` | 列出已入库文件 |
+| GET | `/files/{id}` | 文件详情 |
 | GET | `/files/summary` | 入库统计摘要 |
 | DELETE | `/files/{id}` | 删除文件 |
-| POST | `/files/{id}/reindex` | 重建文件索引 |
-| POST | `/search` | 纯检索 (不生成回答) |
-| POST | `/ask` | RAG 完整问答 |
+| POST | `/files/{id}/reindex` | 重建索引 |
+| POST | `/search` | 纯检索 (含置信度) |
+| POST | `/ask` | RAG 问答 (含多轮对话) |
+| POST | `/ask/stream` | SSE 流式问答 |
+| POST/GET/DELETE | `/conversations` | 会话管理 |

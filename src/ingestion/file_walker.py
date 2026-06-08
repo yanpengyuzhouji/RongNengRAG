@@ -16,9 +16,9 @@ import yaml
 class FileWalker:
     """遍历知识库目录，提取每个文件的结构化元数据"""
 
-    def __init__(self, config_path: str = "D:/rag-system/config.yaml"):
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self, config_path: str = None):
+        from config import load_config
+        self.config = load_config(config_path)
 
         self.kb_path = Path(self.config["paths"]["knowledge_base"])
         self.db_path = self.config["paths"]["metadata_db"]
@@ -414,7 +414,7 @@ class FileWalker:
         conn.commit()
 
 
-def build_file_index(config_path: str = "D:/rag-system/config.yaml"):
+def build_file_index(config_path: str = None):
     """构建文件索引（入口函数）"""
     print("=" * 60)
     print("📁 榕能电力审图知识库 — 文件索引构建器")

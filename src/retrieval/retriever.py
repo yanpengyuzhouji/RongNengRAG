@@ -26,6 +26,7 @@ class RetrievalResult:
     chunk_id: str
     text: str
     score: float
+    confidence: float = 0.0
     domain: str = ""
     category: str = ""
     file_path: str = ""
@@ -77,9 +78,9 @@ class SearchResponse:
 class Retriever:
     """三阶段检索编排器"""
 
-    def __init__(self, config_path: str = "D:/rag-system/config.yaml"):
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self, config_path: str = None):
+        from config import load_config
+        self.config = load_config(config_path)
 
         self.config_path = config_path
         self.analyzer = QueryAnalyzer(config_path)
@@ -155,10 +156,14 @@ class Retriever:
         results = []
         for item in ranked[:top_k]:
             entity = item.get("entity", item)
+            # 置信度: 优先用 reranker 给的 score，否则用 distance
+            raw_score = item.get("_rerank_score", item.get("distance", 0.0))
+            confidence = round(max(0.0, min(1.0, float(raw_score))), 4)
             results.append(RetrievalResult(
                 chunk_id=entity.get("chunk_id", ""),
                 text=entity.get("text", ""),
                 score=item.get("distance", 0.0) if "distance" in item else 0.0,
+                confidence=confidence,
                 domain=entity.get("domain", ""),
                 category=entity.get("category", ""),
                 file_path=entity.get("file_path", ""),
