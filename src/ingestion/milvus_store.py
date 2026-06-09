@@ -298,6 +298,99 @@ class MilvusStore:
         expr = f'chunk_id like "{file_hash}%"'
         self.client.delete(collection_name=self.COLLECTION_NAME, filter=expr)
 
+    def query_by_file_path(self, file_path: str,
+                           sort_by_page: bool = True) -> List[dict]:
+        """
+        查询指定文件的所有 chunks（完整文档内容）
+
+        Args:
+            file_path: 文件路径（支持精确匹配或 LIKE 匹配）
+            sort_by_page: 是否按页码和 chunk_index 排序
+
+        Returns:
+            chunks 列表，按 chunk_index 或 page_num 排序
+        """
+        if not self.client.has_collection(self.COLLECTION_NAME):
+            return []
+
+        try:
+            self.client.load_collection(self.COLLECTION_NAME)
+        except Exception:
+            pass
+
+        # 用 file_path 字段精确匹配
+        # Milvus 标量过滤不支持 LIKE，使用 == 精确匹配
+        expr = f'file_path == "{file_path}"'
+
+        output_fields = [
+            "chunk_id", "text", "domain", "category", "file_path",
+            "doc_number", "voltage_level", "publish_level",
+            "discipline", "equipment_type", "year", "region",
+            "drawing_code", "page_num", "chunk_index", "is_drawing"
+        ]
+
+        try:
+            results = self.client.query(
+                collection_name=self.COLLECTION_NAME,
+                filter=expr,
+                output_fields=output_fields,
+                limit=10000,  # 一个文件可能有大量 chunks
+            )
+        except Exception:
+            return []
+
+        if sort_by_page and results:
+            # 按 page_num 排序，同页按 chunk_index 排序
+            results.sort(key=lambda x: (
+                x.get("page_num", 0) or 0,
+                x.get("chunk_index", 0) or 0,
+            ))
+
+        return results
+
+    def query_by_file_hash(self, file_hash: str,
+                           sort_by_page: bool = True) -> List[dict]:
+        """
+        按文件哈希前缀查询所有 chunks
+
+        chunk_id 格式: {file_hash}_{chunk_index}
+        """
+        if not self.client.has_collection(self.COLLECTION_NAME):
+            return []
+
+        try:
+            self.client.load_collection(self.COLLECTION_NAME)
+        except Exception:
+            pass
+
+        # chunk_id LIKE 前缀
+        expr = f'chunk_id like "{file_hash}%"'
+
+        output_fields = [
+            "chunk_id", "text", "domain", "category", "file_path",
+            "doc_number", "voltage_level", "publish_level",
+            "discipline", "equipment_type", "year", "region",
+            "drawing_code", "page_num", "chunk_index", "is_drawing"
+        ]
+
+        try:
+            results = self.client.query(
+                collection_name=self.COLLECTION_NAME,
+                filter=expr,
+                output_fields=output_fields,
+                limit=10000,
+            )
+        except Exception:
+            return []
+
+        if sort_by_page and results:
+            results.sort(key=lambda x: (
+                x.get("page_num", 0) or 0,
+                x.get("chunk_index", 0) or 0,
+            ))
+
+        return results
+
 
 def build_filter_expression(
     domain: Optional[str] = None,

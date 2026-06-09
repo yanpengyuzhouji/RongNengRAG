@@ -31,6 +31,8 @@ FastAPI (:8000)
 | 会话侧边栏 + 隔离 | 每会话独立历史，自动压缩超窗口消息 |
 | BGE-M3 稠密+稀疏混合检索 | 原生稀疏向量，解决关键词匹配差的问题 |
 | 三阶段检索 (分析→召回→精排) | 兼顾召回率和准确率 |
+| 文件注册表识别 + 完整文档注入 | query 含文件名时注入完整文档，解决 chunk 检索遗漏问题 |
+| 同系列文件排除 | 匹配会议材料之一时排除 02-07，防止 LLM 混淆 |
 | 延迟加载 + 启动预热 | 减少冷启动内存，启动时预加载嵌入模型 |
 
 ## 2. 模块详解
@@ -132,7 +134,51 @@ retrieval:
 5. **同义词扩展**: 电力领域同义词词典 (消防→防火/灭火, 接地→接地装置...)
 6. **Milvus 过滤表达式**: 构建标量过滤条件
 
-### 2.5 重排序器 (`retrieval/reranker.py`)
+### 2.5 文件注册表 (`retrieval/file_registry.py`)
+
+**类**: `FileRegistry` — query 中文件名检测 + 完整文档注入的枢纽
+
+从 SQLite `file_registry` 表读取已入库文件元数据，通过多策略检测用户 query 中是否引用了特定文件。
+
+**四阶段检测策略** (`detect_files_in_query`):
+
+| 阶段 | 策略 | 示例匹配 |
+|------|------|----------|
+| 1 | 正则提取文件名候选（书名号、引号、扩展名） | `"GB50060-2008.pdf"` → `GB50060-2008.pdf` |
+| 2 | 双向子串匹配（文件名 in query / query in 文件名） | `会议材料一` → `01会议材料之一2022年...` |
+| 3 | 文档编号匹配（标准编号 + 发文编号） | `闽电〔2015〕241号` → 精确文件 |
+| 4 | "会议材料之X" 系列匹配 + 中文序数归一化 | `材料三` → `03会议材料之三...` |
+
+**中文数字归一化**:
+```
+一→1 二→2 三→3 四→4 五→5 六→6 七→7 八→8 九→9 十→10
+十一→11 ... 二十→20
+```
+支持 `zfill(2)` 对齐文件名中的 "01" 格式。
+
+**五种自然语言变体**（策略4）:
+- `01会议材料之一` (完整，含数字前缀+之)
+- `会议材料之一` (无数字前缀，有之)
+- `01会议材料一` (有数字前缀，无之)
+- `会议材料一` (无前缀，无之 — 最常见)
+- `材料一` / `材料三` (仅材料+数字)
+
+**API**:
+```python
+registry = FileRegistry()
+
+# 检测 query 中的文件名引用
+matches = registry.detect_files_in_query("会议材料一总结")
+# → [FileMatchResult(entry=..., match_type="partial", match_score=0.85)]
+
+# 按文件名搜索
+entries = registry.search_by_filename("消防", exact=False)
+
+# 获取注册表摘要
+count = registry.get_file_count()  # → 32
+```
+
+### 2.6 重排序器 (`retrieval/reranker.py`)
 
 **类**: `Reranker`
 
@@ -154,7 +200,7 @@ retrieval:
 
 **置信度校准**: 每个结果附带 `confidence` (0-1)，基于 rerank 分数 min-max 归一化。
 
-### 2.6 文件处理器 (`ingestion/file_processor.py`)
+### 2.7 文件处理器 (`ingestion/file_processor.py`)
 
 **类**: `FileProcessor` — 完整入库管道
 
@@ -180,7 +226,7 @@ process(file_path, domain, category)
 
 **.doc 解析**: 通过 `win32com.client.Dispatch("Word.Application")` 自动化本机 Word（Windows），大幅提升旧版 .doc 文件解析成功率。
 
-### 2.7 LLM 推理引擎 (`generation/llm_engine.py`)
+### 2.8 LLM 推理引擎 (`generation/llm_engine.py`)
 
 **类**: `LLMEngine` — Provider 模式 facade
 
@@ -207,7 +253,7 @@ LLMEngine (facade)
 - `general_qa`: 通用问答
 - `SYSTEM_PROMPT_CHAT`: 多轮对话系统提示 (直接回答，不输出思考过程)
 
-### 2.8 对话管理 (`generation/conversation_manager.py`)
+### 2.9 对话管理 (`generation/conversation_manager.py`)
 
 **类**: `ConversationManager`
 
@@ -216,7 +262,7 @@ LLMEngine (facade)
 - 保留最近 `keep_detail_rounds=3` 轮完整内容
 - 所有时间戳使用北京时间 `Asia/Shanghai`
 
-### 2.9 Gradio UI (`ui/app.py`)
+### 2.10 Gradio UI (`ui/app.py`)
 
 **v3.0 重构** — 聊天界面 + 会话管理:
 
@@ -414,7 +460,7 @@ Retriever.search(query, top_k)
     └─ 返回 SearchResponse {results, query_type, domain, elapsed_ms}
 ```
 
-### 4.3 问答流程
+### 4.3 问答流程 (含文件注册表注入)
 
 ```
 用户输入问题
@@ -423,15 +469,39 @@ Retriever.search(query, top_k)
 /ask 端点
     │
     ├─ Retriever.search() → 检索结果
-    ├─ Retriever.format_context_for_llm() → 格式化上下文
+    │
+    ├─ [新增] FileRegistry.detect_files_in_query(query)
+    │   └─ 四策略匹配 → FileMatchResult? (文件名 + score + 系列标识)
+    │
+    ├─ 分支判断:
+    │   │
+    │   ├─ 检测到文件名:
+    │   │   ├─ MilvusStore.query_by_file_hash() → 完整文档 chunks
+    │   │   ├─ _format_full_document() → 按页码排序拼接
+    │   │   ├─ _extract_series_key() → 识别系列标识
+    │   │   ├─ 构建上下文:
+    │   │   │   ├─ [主] 完整文档 + 强化聚焦指令
+    │   │   │   ├─ [补充] 非主文件 + 非同系列 + 最多2个
+    │   │   │   └─ 标注: "以下仅供背景，请勿引用"
+    │   │   └─ → LLM
+    │   │
+    │   └─ 未检测到文件名:
+    │       └─ Retriever.format_context_for_llm() → 正常格式化
     │
     ├─ LLMEngine.generate_rag_answer(query, context, query_type)
     │   ├─ get_prompt(query_type) → 选择合适的提示词模板
     │   ├─ 填充 {context} 和 {query}
-    │   └─ Ollama /v1/chat/completions → 生成回答
+    │   └─ Ollama /api/chat → 生成回答
     │
     └─ 返回 AskResponse {answer, citations, sources, elapsed_ms}
 ```
+
+**文件注册表注入关键规则**:
+- 匹配到文件 → **优先用 file_hash 查询**（chunk_id 前缀，最可靠）
+- 完整文档前置，聚焦指令强硬: "**只**基于上述完整文档内容回答"
+- 同系列文件**100% 排除**: 匹配材料01 → 自动过滤02-07
+- 补充检索从 5+ 个缩减至**最多 2 个**，且标注不可引用
+- 检索无结果时仍尝试从注册表拉取: 纯文件名查询也能拿到答案
 
 ## 5. 部署配置
 
@@ -467,8 +537,10 @@ Retriever.search(query, top_k)
 | 嵌入维度 | 1024 (BGE-M3 稠密) + 原生稀疏 |
 | 单次嵌入耗时 | ~7s / 16 chunks (GPU) |
 | 检索耗时 | ~3s (QueryAnalyze+HybridSearch+Rerank) |
-| 问答总耗时 | ~20-30s (qwen3.5:4b think=false + 32k ctx) |
-| LLM token/s | ~25-35 t/s (32k 上下文) |
+| LLM token/s | **~112 t/s** (qwen3:4b, 32k ctx, Ollama eval_rate) |
+| 问答总耗时 | ~8-15s (搜索3s + LLM生成5-12s, think=false时) |
 | 粗召回候选数 | 50 |
 | 精排结果数 | 15 (可配置) |
 | GPU | NVIDIA RTX 4070 SUPER (12GB) |
+
+> **注**: Qwen3 推理模型强制 thinking，112 t/s 中仅 1-15% 为有效内容（剩余被内部思维链消耗）。Qwen3.5 通过 `think=false` 彻底关闭思维链后，112 t/s 全部为有效输出。

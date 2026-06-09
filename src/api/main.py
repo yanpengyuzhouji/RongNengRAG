@@ -16,6 +16,7 @@ FastAPI 后端服务 — 榕能电力审图知识库 RAG API
 import sys
 import os
 import json
+import re
 import time
 import shutil
 from typing import Optional, List
@@ -75,6 +76,72 @@ _processor: FileProcessor = None
 _retriever: Retriever = None
 _llm: LLMEngine = None
 _conv_mgr: ConversationManager = None
+
+
+def _build_file_aware_context(context: str, query: str, retriever) -> str:
+    """
+    当查询包含文件名时, 通过文件注册表识别并注入完整文档到 prompt。
+    这是旧版 _build_focused_context 的升级版:
+      - 旧版仅在 context 顶部加一句提示
+      - 新版通过 FileRegistry 从向量库中拉取完整文档内容注入
+
+    若 retriever 未就绪, 回退到纯文本匹配的聚焦提示。
+    """
+    if retriever is None:
+        return _build_focused_context_fallback(context, query)
+
+    try:
+        ctx, match = retriever.build_context_with_file_injection(
+            query=query,
+            search_results=[],  # 此时不需要补充检索结果, 由调用方传入完整 context
+            max_chunks=15,
+        )
+        # build_context_with_file_injection 返回的 context 已经包含完整文档
+        # 检查是否真的有匹配
+        if match is not None and ctx.strip():
+            return ctx
+    except Exception:
+        pass
+
+    return _build_focused_context_fallback(context, query)
+
+
+def _build_focused_context_fallback(context: str, query: str) -> str:
+    """
+    回退方案: 纯文本模式匹配的聚焦提示。
+    当文件注册表不可用或未匹配到文件时使用。
+    """
+    # 检测 "XX会议材料之X" 或 "XX材料之X" 模式
+    m = re.search(r'(\d{2})\s*会议材料之([一二三四五六七八九十]+)', query)
+    if not m:
+        m = re.search(r'(\d+)\s*(会议材料|材料)', query)
+
+    if not m:
+        return context
+
+    num = m.group(1)
+    # 在 context 中找匹配的文件
+    import re as re2
+    target_file = None
+    pattern = rf'{num}[^.]*会议材料之[^.]*\.(pdf|doc|docx)'
+    match = re2.search(pattern, context)
+    if match:
+        target_file = match.group(0)
+    else:
+        # 宽泛匹配: 文件名含 num
+        for line in context.split('\n'):
+            if f'文件: {num}' in line and '会议材料' in line:
+                target_file = line.strip()
+                break
+
+    if target_file:
+        return (
+            f"【重要: 用户要查询的是文件 \"{target_file}\" 的内容, "
+            f"请只基于该文件的 chunks 回答, 其他文件内容仅供背景参考, 不要混淆。】\n\n"
+            f"{context}"
+        )
+
+    return context
 
 
 def get_processor() -> FileProcessor:
@@ -479,16 +546,39 @@ async def ask(req: AskRequest):
     resp = r.search(query=req.query, top_k=req.top_k, domain_filter=req.domain_filter)
 
     if not resp.results:
-        answer = "未找到相关内容"
-        # 仍然记录到会话
-        if req.conversation_id:
-            conv_mgr = get_conv_mgr()
-            conv_mgr.add_message(req.conversation_id, "user", req.query)
-            conv_mgr.add_message(req.conversation_id, "assistant", answer)
-        return AskResponse(query=req.query, answer=answer, citations=[], sources=[],
-                          elapsed_ms=(time.time() - t0) * 1000)
-
-    context = r.format_context_for_llm(resp.results, max_chunks=req.top_k)
+        # 即使搜索无结果, 也尝试文件注册表: 用户可能提到了精确的文件名
+        file_match = r.detect_file_in_query(req.query)
+        if file_match:
+            file_path = (file_match.entry.original_path or
+                         file_match.entry.stored_path or
+                         file_match.entry.file_name)
+            full_doc = r.get_full_document(
+                file_path=file_path,
+                file_hash=file_match.entry.file_hash,
+            )
+            if full_doc:
+                context = full_doc
+                # Fall through to LLM generation below
+            else:
+                answer = "未找到相关内容"
+                if req.conversation_id:
+                    conv_mgr = get_conv_mgr()
+                    conv_mgr.add_message(req.conversation_id, "user", req.query)
+                    conv_mgr.add_message(req.conversation_id, "assistant", answer)
+                return AskResponse(query=req.query, answer=answer, citations=[], sources=[],
+                                  elapsed_ms=(time.time() - t0) * 1000)
+        else:
+            answer = "未找到相关内容"
+            if req.conversation_id:
+                conv_mgr = get_conv_mgr()
+                conv_mgr.add_message(req.conversation_id, "user", req.query)
+                conv_mgr.add_message(req.conversation_id, "assistant", answer)
+            return AskResponse(query=req.query, answer=answer, citations=[], sources=[],
+                              elapsed_ms=(time.time() - t0) * 1000)
+    else:
+        context, file_match = r.build_context_with_file_injection(
+            query=req.query, search_results=resp.results, max_chunks=req.top_k
+        )
     llm = get_llm()
 
     # 多轮对话: 使用完整历史消息
@@ -511,7 +601,7 @@ async def ask(req: AskRequest):
             # 最后一条用户消息附带检索上下文
             messages.append({
                 "role": "user",
-                "content": f"参考资料:\n{context}\n\n用户问题: {req.query}\n\n请回答:"
+                "content": f"{context}\n\n用户问题: {req.query}\n\n请根据以上文件内容回答:"
             })
 
             answer = llm.generate_chat(messages, temperature=0.1)
@@ -567,10 +657,28 @@ async def ask_stream(req: AskRequest):
         resp = r.search(query=req.query, top_k=req.top_k, domain_filter=req.domain_filter)
 
         if not resp.results:
-            yield f"data: {json.dumps({'token': '未找到相关内容', 'done': True, 'citations': [], 'sources': [], 'elapsed_ms': (time.time() - t0) * 1000})}\n\n"
-            return
-
-        context = r.format_context_for_llm(resp.results, max_chunks=req.top_k)
+            file_match = r.detect_file_in_query(req.query)
+            if file_match:
+                file_path = (file_match.entry.original_path or
+                             file_match.entry.stored_path or
+                             file_match.entry.file_name)
+                full_doc = r.get_full_document(
+                    file_path=file_path,
+                    file_hash=file_match.entry.file_hash,
+                )
+                if full_doc:
+                    context = full_doc
+                    # Fall through to LLM generation below
+                else:
+                    yield f"data: {json.dumps({'token': '未找到相关内容', 'done': True, 'citations': [], 'sources': [], 'elapsed_ms': (time.time() - t0) * 1000})}\n\n"
+                    return
+            else:
+                yield f"data: {json.dumps({'token': '未找到相关内容', 'done': True, 'citations': [], 'sources': [], 'elapsed_ms': (time.time() - t0) * 1000})}\n\n"
+                return
+        else:
+            context, file_match = r.build_context_with_file_injection(
+                query=req.query, search_results=resp.results, max_chunks=req.top_k
+            )
         llm = get_llm()
 
         if not llm:
@@ -602,7 +710,7 @@ async def ask_stream(req: AskRequest):
                     messages.append(hm)
                 messages.append({
                     "role": "user",
-                    "content": f"参考资料:\n{context}\n\n用户问题: {req.query}\n\n请回答:"
+                    "content": f"{context}\n\n用户问题: {req.query}\n\n请根据以上文件内容回答:"
                 })
 
                 full_answer = ""

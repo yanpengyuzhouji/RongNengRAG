@@ -201,7 +201,7 @@ retrieval:
 llm:
   provider: "ollama"        # "ollama" / "bailian" / "llama_cpp"
   ollama:
-    model: "qwen3.5:4b"           # Qwen3.5支持think:false, 可完全关闭思考链
+    model: "qwen3.5:4b"           # ✅ 已安装，think:false 关闭思考链
     base_url: "http://localhost:11434"
     temperature: 0.1
     num_ctx: 32768

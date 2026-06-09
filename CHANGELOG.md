@@ -2,6 +2,51 @@
 
 ## 2026-06-08
 
+### 文件注册表识别 + 完整文档注入
+
+- **新增** `src/retrieval/file_registry.py` — `FileRegistry` 类:
+  - 从 SQLite `file_registry` 表读取已入库文件元数据，60 秒缓存
+  - `detect_files_in_query(query)` — 四阶段多策略文件名检测:
+    - **策略1**: 正则提取 query 中的文件名候选（书名号、引号、扩展名模式、文档编号）
+    - **策略2**: 双向匹配 — 文件名 in query + query 关键词 in 文件名（解决短 query 匹配长文件名问题）
+    - **策略3**: 文档编号精确匹配（闽电发展〔2015〕241号、GB 50060-2008 等）
+    - **策略4**: "会议材料之X" / "会议材料X" 系列匹配 — 含中文数字序数归一化（一→1）
+  - 支持五种自然语言写法: `01会议材料之一` / `会议材料之一` / `01会议材料一` / `会议材料一` / `材料一`
+  - 中文→阿拉伯数字映射: 一～二十 → 1~20，含 `zfill(2)` 对齐 "01" 格式
+  - `_extract_query_phrases(query)` — 将 query 拆解为关键词片段并生成数字变体
+  - 返回 `FileMatchResult`（含 `match_type`、`match_score`、`match_text`），去重 + 按分数降序
+
+- **修改** `src/ingestion/milvus_store.py`:
+  - 新增 `query_by_file_path(file_path)` — 按 `file_path` 精确查询文件的完整 chunks
+  - 新增 `query_by_file_hash(file_hash)` — 按 `chunk_id LIKE "{hash}%"` 前缀查询（主方案，最可靠）
+  - 返回结果按 `page_num` + `chunk_index` 排序
+
+- **修改** `src/retrieval/retriever.py`:
+  - `__init__` 新增 `self.file_registry` 实例
+  - 新增 `detect_file_in_query(query)` — 委托 FileRegistry 返回最佳匹配
+  - 新增 `get_full_document(file_path, file_hash)` — 从 Milvus 拉取完整文档、格式化输出（含页眉+页码导航）
+  - 新增 `build_context_with_file_injection(query, search_results, max_chunks)` — LLM 上下文构建核心:
+    - 检测到文件名: 完整文档前置 + 强化聚焦指令 + 补充检索（排除同系列 + 最多 2 个）
+    - 未检测到: 正常检索格式
+  - 新增 `_extract_series_key(filename)` — 从文件名提取"系列标识"
+    - "01会议材料之一..." → `会议材料之`
+    - 用于排除同系列文件干扰（查询材料01时排除02-07）
+  - 聚焦指令强化: `"请只基于上述完整文档内容回答，不要引用其他文件"`
+  - 补充检索结果标注: `"以下内容仅供背景了解，回答时请勿引用"`
+  - 补充最多保留 2 个文件（原 5+ 个）
+  - 新增 debug 日志输出匹配过程
+
+- **修改** `src/api/main.py`:
+  - `/ask` 和 `/ask/stream` 端点改用 `r.build_context_with_file_injection()` 替代旧版 `_build_focused_context`
+  - 边界处理: 检索无结果但 query 含文件名时，从注册表拉取完整文档再送 LLM
+  - 保留 `_build_focused_context_fallback` 作为纯文本回退方案
+
+- **效果**:
+  - 查询 "会议材料一总结" → 精确匹配 01 文件，排除 02-07，回答仅含材料一内容
+  - 查询含文件名 → score=1.0 精确匹配，注入完整文档（22k+ chars）
+  - 查询无文件名 → 不触发，正常检索流程
+  - 同系列文件 100% 排除，不再混淆
+
 ### Qwen3 强制思考链优化 — 终极方案
 
 - **根因**: Qwen3 (4b/8b/14b) 和 DeepSeek-R1 是推理模型，强制生成 thinking tokens（占 85-95% 输出），`enable_thinking=false` 和 `disable_cot=true` 均对 Qwen3 无效
