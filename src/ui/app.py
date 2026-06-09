@@ -128,7 +128,7 @@ def delete_current_conv(conv_id: str):
 
 
 def chat_stream(query: str, history: list, conv_id: str, domain_filter: str, top_k: int):
-    """流式聊天 - Gradio generator"""
+    """流式聊天 — SSE token 级实时渲染"""
     if not query or not query.strip():
         yield history, conv_id
         return
@@ -140,16 +140,13 @@ def chat_stream(query: str, history: list, conv_id: str, domain_filter: str, top
             yield history, conv_id
             return
 
-    # 添加用户消息
-    history.append({"role": "user", "content": query})
-
-    # 先用占位符添加 assistant 消息
+    # 添加用户消息 + 占位 message
     time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    history.append({"role": "user", "content": query})
     history.append({"role": "assistant", "content": "🔍 检索中..."})
-
     yield history, conv_id
 
-    # 调用流式 API
+    # 调用 SSE 流式 API
     try:
         domain_val = None if domain_filter == "全部" else domain_filter
         resp = requests.post(
@@ -161,11 +158,14 @@ def chat_stream(query: str, history: list, conv_id: str, domain_filter: str, top
                 "conversation_id": conv_id,
             },
             stream=True,
-            timeout=(120, 900),  # 120s连接等待 + 900s流式读取
+            timeout=(120, 900),
         )
 
         full_answer = ""
         thinking_shown = False
+        searching_shown = True
+        last_yield = time.time()
+
         for line in resp.iter_lines():
             if not line:
                 continue
@@ -188,34 +188,48 @@ def chat_stream(query: str, history: list, conv_id: str, domain_filter: str, top
                         continue
 
                     if status == "thinking":
-                        # Qwen3 推理模型思考中 — 显示动画
-                        if not thinking_shown:
-                            thinking_shown = True
-                        dots_count = ((int(time.time() * 2) % 4) + 1)
-                        dots = "." * dots_count
-                        history[-1] = {"role": "assistant", "content": f"💭 思考中{dots}\n*(Qwen3 推理模型正在分析问题...)*"}
-                        yield history, conv_id
+                        thinking_shown = True
+                        searching_shown = False
+                        # 心跳动画 — 每 0.5s 更新一次
+                        now = time.time()
+                        if now - last_yield > 0.3:
+                            dots_count = ((int(now * 2) % 4) + 1)
+                            dots = "." * dots_count
+                            history[-1] = {"role": "assistant", "content": f"💭 思考中{dots}"}
+                            yield history, conv_id
+                            last_yield = now
                         continue
 
-                    # 有实际内容了
-                    thinking_shown = False
+                    # 有实际 token 输出
+                    searching_shown = False
+                    if thinking_shown:
+                        thinking_shown = False
+                        full_answer = ""  # 清空思考占位
+
                     full_answer += token
-                    display = full_answer + "\n\n---\n*" + time_str + " (北京时间)*"
-                    history[-1] = {"role": "assistant", "content": display}
-                    yield history, conv_id
+
+                    # 限流: 最多每 0.1s 刷新一次，避免过度渲染
+                    now = time.time()
+                    if now - last_yield > 0.08:
+                        display = full_answer + f"\n\n---\n*⏱ {time_str} (北京时间) | ⚡ 流式生成中...*"
+                        history[-1] = {"role": "assistant", "content": display}
+                        yield history, conv_id
+                        last_yield = now
 
                 except json.JSONDecodeError:
                     pass
 
         # 最终更新
         if full_answer:
-            display = full_answer + "\n\n---\n*" + time_str + " (北京时间)*"
+            display = full_answer + f"\n\n---\n*⏱ {time_str} (北京时间)*"
             history[-1] = {"role": "assistant", "content": display}
         else:
-            history[-1] = {"role": "assistant", "content": "[WARN] 未获取到回答"}
+            history[-1] = {"role": "assistant", "content": "[WARN] 未获取到回答 — 请确认知识库已入库相关文档"}
 
     except requests.ConnectionError:
-        history[-1] = {"role": "assistant", "content": "[ERROR] 无法连接后端 API"}
+        history[-1] = {"role": "assistant", "content": "[ERROR] 无法连接后端 API — 请确认服务已启动"}
+    except requests.Timeout:
+        history[-1] = {"role": "assistant", "content": "[ERROR] 请求超时 — 请重试"}
     except Exception as e:
         history[-1] = {"role": "assistant", "content": f"[ERROR] {str(e)[:200]}"}
 
@@ -224,15 +238,21 @@ def chat_stream(query: str, history: list, conv_id: str, domain_filter: str, top
 
 # ========== 文件上传入库 ==========
 
-def upload_and_index(files, domain: str, category: str):
+def upload_and_index(files, domain: str, category: str, progress=gr.Progress()):
     if not files:
         return "[WARN] 请先选择文件"
 
+    total = len(files)
     results = []
     ok_count = 0
-    for f in files:
+
+    progress(0, desc=f"准备入库 {total} 个文件...")
+
+    for i, f in enumerate(files):
+        orig_name = os.path.basename(f.name)
+        progress((i + 1) / total, desc=f"[{i+1}/{total}] 正在处理: {orig_name[:30]}...")
+
         try:
-            orig_name = os.path.basename(f.name)
             with open(f.name, "rb") as fh:
                 form_data = {}
                 if domain and domain != "自动":
@@ -243,27 +263,52 @@ def upload_and_index(files, domain: str, category: str):
                     f"{API_BASE}/upload",
                     files={"file": (orig_name, fh)},
                     data=form_data,
-                    timeout=300,
+                    timeout=600,
                 )
             if resp.status_code == 200:
                 r = resp.json()
                 ok_count += 1
-                icon = "[OK]" if r.get("success") else "[WARN]"
-                chunk_info = f"chunks:{r.get('chunks_created',0)}"
-                time_info = f"{r.get('total_time_ms',0):.0f}ms"
-                results.append(f"| {icon} {orig_name[:50]} | {chunk_info} | {time_info} |")
+                icon = "✅" if r.get("success") else "⚠"
+                chunks = r.get('chunks_created', 0)
+                chars = r.get('chars_extracted', 0)
+                t = r.get('total_time_ms', 0)
+                results.append(
+                    f"| {icon} | {orig_name[:45]} | {chunks} | {chars:,} | {t/1000:.1f}s |"
+                )
                 msg = r.get("error_message", "")
                 if msg:
-                    results.append(f"|   {msg[:120]} |")
+                    results.append(f"| | {msg[:100]} | | | |")
             else:
-                results.append(f"| [ERR] {orig_name[:40]} | HTTP {resp.status_code} |")
+                results.append(f"| ❌ | {orig_name[:45]} | - | - | HTTP {resp.status_code} |")
+                # Try to read error detail
+                try:
+                    err_detail = resp.json()
+                    if isinstance(err_detail, dict) and 'detail' in err_detail:
+                        results.append(f"| | {str(err_detail['detail'])[:100]} | | | |")
+                except Exception:
+                    pass
+        except requests.Timeout:
+            results.append(f"| ❌ | {orig_name[:45]} | - | - | 超时 (600s) |")
         except Exception as e:
-            results.append(f"| [ERR] {os.path.basename(f.name)[:40]}: {str(e)[:80]} |")
+            results.append(f"| ❌ | {orig_name[:40]} | - | - | {str(e)[:60]} |")
+
+        # 实时刷新: 每次处理完一个文件就更新显示
+        header = [
+            f"## 入库进度 ({i+1}/{total})",
+            f"| 状态 | 文件名 | Chunks | 字符数 | 耗时 |",
+            f"|---|---|---:|---:|---:|",
+        ]
+        progress((i + 1) / total, desc=f"[{i+1}/{total}] 完成 {orig_name[:20]}")
 
     if not results:
         return "[WARN] 无文件被处理"
 
-    header = [f"## 入库结果 ({ok_count}/{len(files)} 成功)", f"| 文件 | 详情 |", f"|---|---|"]
+    header = [
+        f"## 入库结果 ({ok_count}/{total} 成功)",
+        f"| 状态 | 文件名 | Chunks | 字符数 | 耗时 |",
+        f"|---|---|---:|---:|---:|",
+    ]
+    progress(1.0, desc="入库完成!")
     return "\n".join(header + results)
 
 
