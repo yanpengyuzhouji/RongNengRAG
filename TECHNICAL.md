@@ -33,7 +33,8 @@ FastAPI (:8000)
 | 三阶段检索 (分析→召回→精排) | 兼顾召回率和准确率 |
 | 文件注册表识别 + 完整文档注入 | query 含文件名时注入完整文档，解决 chunk 检索遗漏问题 |
 | 同系列文件排除 | 匹配会议材料之一时排除 02-07，防止 LLM 混淆 |
-| 延迟加载 + 启动预热 | 减少冷启动内存，启动时预加载嵌入模型 |
+| PaddleOCR 扫描件识别 | 子进程隔离，自动检测文字量不足的页面并 OCR |
+| 延迟加载 + 启动预热 | 减少冷启动内存，启动时预加载嵌入+OCR模型 |
 
 ## 2. 模块详解
 
@@ -200,7 +201,45 @@ count = registry.get_file_count()  # → 32
 
 **置信度校准**: 每个结果附带 `confidence` (0-1)，基于 rerank 分数 min-max 归一化。
 
-### 2.7 文件处理器 (`ingestion/file_processor.py`)
+### 2.7 OCR 引擎 (`ingestion/ocr_engine.py`)
+
+**类**: `OCREngine` — PaddleOCR 子进程隔离封装
+
+通过子进程运行 PaddleOCR，解决 paddlepaddle (需 protobuf ≤3.20) 与 pymilvus (需 protobuf ≥5.27) 的版本冲突。
+
+**架构**:
+```
+主进程 (protobuf 5.x + pymilvus)
+    │
+    │  subprocess.run()
+    ▼
+OCR 子进程 (PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python)
+    │
+    ├─ import torch (先加载，固定 DLL)
+    ├─ import paddle
+    └─ paddleocr.PaddleOCR (lang="ch", PP-OCRv4)
+```
+
+**批量子进程模式** (`--batch`):
+- 主进程将图片路径列表通过 stdin JSON 传给子进程
+- 子进程一次性加载模型，批量处理所有图片
+- 4 页仅需 1 次子进程启动（vs 逐页 4 次）
+- 性能: 首次 ~10s (模型加载) + ~1.5s/页
+
+**API**:
+```python
+engine = OCREngine(use_subprocess=True)
+
+# 单图 OCR
+result = engine.ocr_page("/path/to/page.png")
+# → {"success": True, "text": "识别文本", "lines": [...], "elapsed_ms": 1234}
+
+# PDF 批量 OCR
+result = engine.ocr_pdf_pages("/path/to/doc.pdf", [0, 1, 4])
+# → {"success": True, "text": "合并文本", "pages": {1: {...}, 2: {...}}, ...}
+```
+
+### 2.8 文件处理器 (`ingestion/file_processor.py`)
 
 **类**: `FileProcessor` — 完整入库管道
 
@@ -226,7 +265,7 @@ process(file_path, domain, category)
 
 **.doc 解析**: 通过 `win32com.client.Dispatch("Word.Application")` 自动化本机 Word（Windows），大幅提升旧版 .doc 文件解析成功率。
 
-### 2.8 LLM 推理引擎 (`generation/llm_engine.py`)
+### 2.9 LLM 推理引擎 (`generation/llm_engine.py`)
 
 **类**: `LLMEngine` — Provider 模式 facade
 
@@ -253,7 +292,7 @@ LLMEngine (facade)
 - `general_qa`: 通用问答
 - `SYSTEM_PROMPT_CHAT`: 多轮对话系统提示 (直接回答，不输出思考过程)
 
-### 2.9 对话管理 (`generation/conversation_manager.py`)
+### 2.10 对话管理 (`generation/conversation_manager.py`)
 
 **类**: `ConversationManager`
 
@@ -262,7 +301,7 @@ LLMEngine (facade)
 - 保留最近 `keep_detail_rounds=3` 轮完整内容
 - 所有时间戳使用北京时间 `Asia/Shanghai`
 
-### 2.10 Gradio UI (`ui/app.py`)
+### 2.11 Gradio UI (`ui/app.py`)
 
 **v3.0 重构** — 聊天界面 + 会话管理:
 

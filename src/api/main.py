@@ -69,6 +69,27 @@ async def startup():
             print("[startup] 嵌入+重排序模型预热完成")
         except Exception as ex:
             print(f"[startup] 模型预热跳过: {ex}")
+
+        # 预热 OCR 引擎 (子进程隔离, 首次加载约 10-15s)
+        ocr_cfg = cfg.get("ocr", {})
+        if ocr_cfg.get("enabled"):
+            print("[startup] 预热 OCR 模型 (PaddleOCR)...")
+            try:
+                from ingestion.ocr_engine import OCREngine
+                import tempfile, os
+                # 创建最小测试图片触发模型加载
+                from PIL import Image, ImageDraw
+                img = Image.new('RGB', (200, 60), color='white')
+                draw = ImageDraw.Draw(img)
+                draw.text((10, 20), 'OCR预热测试', fill='black')
+                tmp = os.path.join(tempfile.gettempdir(), '_ocr_warmup.png')
+                img.save(tmp)
+                engine = OCREngine(use_subprocess=True)
+                _ = engine.ocr_page(tmp)
+                os.remove(tmp)
+                print("[startup] OCR 模型预热完成")
+            except Exception as ex:
+                print(f"[startup] OCR 预热跳过: {ex}")
     threading.Thread(target=warmup, daemon=True).start()
 
 # 全局实例 (延迟加载)
@@ -288,7 +309,7 @@ async def upload_file(
     processor = get_processor()
 
     # 检查文件类型
-    allowed_exts = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    allowed_exts = {".pdf", ".doc", ".docx", ".wps", ".xls", ".xlsx", ".ppt", ".pptx",
                     ".txt", ".md", ".ofd", ".jpg", ".jpeg", ".png", ".ceb"}
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in allowed_exts:

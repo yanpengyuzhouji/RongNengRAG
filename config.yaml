@@ -160,6 +160,15 @@ chunking:
   full_document:
     max_chars_for_full: 1500  # <1500字符的短文档不拆分
 
+# ===== OCR 配置 (扫描件 PDF 识别) =====
+ocr:
+  enabled: true                    # 是否启用 OCR (扫描件识别)
+  provider: "paddleocr"            # PaddleOCR (子进程隔离)
+  lang: "ch"                       # 语言: ch=中文
+  dpi: 200                         # PDF 渲染 DPI (越大越清晰)
+  min_text_chars: 50               # 单页最少文本字符，低于此值触发 OCR
+  use_subprocess: true             # 子进程隔离 (避免 protobuf 冲突)
+
 # ===== 嵌入模型配置 =====
 embedding:
   provider: "sentence_transformers"   # "sentence_transformers" (本地GPU) 或 "ollama"

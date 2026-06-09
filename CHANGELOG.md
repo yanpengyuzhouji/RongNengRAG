@@ -1,5 +1,58 @@
 # 开发日志
 
+## 2026-06-09
+
+### PaddleOCR 扫描件 PDF 识别
+
+- **新增** `src/ingestion/ocr_engine.py` — PaddleOCR 引擎（子进程隔离模式）:
+  - 通过子进程运行 OCR，解决 paddlepaddle protobuf 3.x 与 pymilvus protobuf 5.x 版本冲突
+  - 主进程: `protobuf>=5.27.2` (pymilvus 正常) / OCR 子进程: `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python`
+  - 支持 `--batch` 批量模式: 一次子进程加载模型，处理多张图片（4x 加速）
+  - 单页模式: `ocr_page(image_path)` → 子进程单图 OCR
+  - PDF 批量模式: `ocr_pdf_pages(pdf_path, pages)` → 渲染 PNG → 子进程批量识别
+  - `OCREngine` 类: `use_subprocess=True` 自动隔离模式
+  - 首次调用 ~10s (模型加载)，后续 ~1.5s/页 (CPU)
+  - 子进程超时保护 600s / 120s
+- **修改** `src/ingestion/pdf_parser.py`:
+  - `__init__` 新增 `ocr_config` 参数
+  - 新增 `_get_ocr_engine()` — 延迟加载 OCR 引擎
+  - 新增 `ocr_pages(filepath, pages)` — 批量 OCR PDF 页面
+  - 新增 `ocr_page(image_path)` — 单图 OCR
+- **修改** `src/ingestion/file_processor.py`:
+  - `__init__` — 传递 OCR 配置给 PDFParser
+  - `_parse_file` PDF 分支 — 解析后检测 `needs_ocr_pages`，自动调用 OCR 并回填文本
+  - OCR 文本与原 fitz 文本智能合并（有则追加）
+- **修改** `src/api/main.py`:
+  - 服务启动时异步预热 OCR 子进程（首次调用不等待）
+- **修改** `config.yaml` — 新增 `ocr` 配置节:
+  ```yaml
+  ocr:
+    enabled: true          # 启用 OCR
+    provider: "paddleocr"  # PaddleOCR
+    lang: "ch"             # 中文
+    dpi: 200               # PDF 渲染 DPI
+    min_text_chars: 50     # 触发 OCR 阈值
+    use_subprocess: true   # 子进程隔离
+  ```
+- **效果**:
+  - 208 页 PDF: 4 页标记为扫描件 → 批量 OCR 6s (1.5s/页)
+  - 封面页识别: "国家电网有限公司 / 十八项电网重大反事故措施 / （修订版）" (99.8% 置信度)
+  - 空白页正确跳过，不消耗额外 OCR 时间
+  - 不影响原有文字型 PDF 的解析速度（仅在 `needs_ocr` 时触发）
+
+### .wps 文件解析支持
+
+- **修改** `src/ingestion/file_processor.py`:
+  - `_parse_file` 新增 `.wps` 分支
+  - 新增 `_parse_wps_file()` — 6 级回退解析管道
+  - 新增 `_parse_wps_via_docx()` — 新版 WPS (ZIP+XML) 用 python-docx 读取
+  - 新增 `_parse_wps_via_zip()` — 备选: 直接解压 ZIP 提取 XML 文本
+  - 新增 `_parse_wps_via_wps_com()` — WPS Office COM 自动化
+  - 后 3 级复用 .doc 管道 (LibreOffice / olefile / MS Word COM)
+- **修改** `src/api/main.py` — 上传白名单添加 `.wps`
+
+---
+
 ## 2026-06-08
 
 ### 文件注册表识别 + 完整文档注入

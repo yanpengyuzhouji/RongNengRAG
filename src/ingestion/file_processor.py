@@ -91,7 +91,11 @@ class FileProcessor:
         self.config = load_config(config_path)
         self.config_path = config_path or get_config_path()
 
-        self.pdf_parser = PDFParser()
+        ocr_cfg = self.config.get("ocr", {})
+        self.pdf_parser = PDFParser(
+            min_text_chars=ocr_cfg.get("min_text_chars", 50),
+            ocr_config=ocr_cfg,
+        )
         self.chunker = Chunker(config_path)
         self.embedder = None  # 延迟加载
         self.store = MilvusStore(config_path)
@@ -564,6 +568,51 @@ class FileProcessor:
                 return self.chunker.chunk_drawing(text, file_meta)
             else:
                 parsed = self.pdf_parser.parse(file_path)
+
+                # === OCR 集成: 对扫描件页面进行识别 ===
+                ocr_enabled = self.config.get("ocr", {}).get("enabled", False)
+                needs_ocr = parsed.get("needs_ocr_pages", [])
+
+                if ocr_enabled and needs_ocr:
+                    # 将 OCR 页面索引转为 0-based
+                    ocr_pages_0based = [p - 1 for p in needs_ocr]
+                    print(f"   [OCR] 检测到 {len(needs_ocr)} 页需要 OCR: "
+                          f"{needs_ocr[:10]}{'...'if len(needs_ocr)>10 else ''}")
+
+                    try:
+                        ocr_texts = self.pdf_parser.ocr_pages(
+                            file_path, ocr_pages_0based
+                        )
+                        # 将 OCR 结果回填到 parsed 数据中
+                        for page_idx, ocr_text in ocr_texts.items():
+                            if page_idx < len(parsed["pages"]):
+                                old_text = parsed["pages"][page_idx]["text"]
+                                old_chars = parsed["pages"][page_idx]["char_count"]
+                                parsed["pages"][page_idx]["text"] = ocr_text
+                                parsed["pages"][page_idx]["char_count"] = len(ocr_text)
+                                parsed["pages"][page_idx]["needs_ocr"] = False
+                                parsed["pages"][page_idx]["ocr_applied"] = True
+                                parsed["total_chars"] += len(ocr_text) - old_chars
+                                if old_text.strip():
+                                    # 原有一些文本，合并而非替换
+                                    parsed["pages"][page_idx]["text"] = (
+                                        old_text + "\n" + ocr_text
+                                    )
+                                    parsed["pages"][page_idx]["char_count"] = (
+                                        old_chars + len(ocr_text)
+                                    )
+
+                        # 更新 needs_ocr_pages
+                        still_needs = [
+                            p for p in needs_ocr
+                            if (p - 1) not in ocr_texts
+                        ]
+                        parsed["needs_ocr_pages"] = still_needs
+                        parsed["is_scanned"] = len(still_needs) > len(needs_ocr) * 0.5
+
+                    except Exception as exc:
+                        print(f"   [OCR] OCR 失败 (跳过): {exc}")
+
                 return self.chunker.chunk_pdf_document(parsed, file_meta)
 
         # DOC (old binary Word format)
@@ -627,6 +676,14 @@ class FileProcessor:
                 return self.chunker.chunk_text_document(text, file_meta)
             except Exception:
                 return []
+
+        # WPS (金山 WPS 文字文档)
+        # WPS 有两代格式: 旧版 OLE2 二进制容器, 新版 ZIP+XML 容器
+        elif ext == ".wps":
+            text = self._parse_wps_file(file_path)
+            if text:
+                return self.chunker.chunk_text_document(text, file_meta)
+            return []
 
         # DWG (跳过，需专用解析器)
         elif ext in (".dwg", ".dxf"):
@@ -860,4 +917,177 @@ class FileProcessor:
             pass
         except Exception:
             pass
+        return ""
+
+    # ===== WPS 文件解析 (.wps) =====
+
+    def _parse_wps_file(self, file_path: str) -> str:
+        """
+        解析 .wps 文件 (金山 WPS 文字文档)
+
+        WPS 有两代格式:
+          - 新版 WPS (2010+): ZIP + XML 容器, 内部结构与 .docx 相同
+          - 旧版 WPS (2005 及以前): OLE2 二进制容器, 类似旧 .doc
+
+        按优先级尝试多种后端:
+          1. python-docx (新版 .wps 本质是 .docx)
+          2. zipfile 直接解压提取 XML 文本 (新版备选)
+          3. LibreOffice headless 转换 (旧版+新版通用)
+          4. olefile 原始提取 (旧版 OLE2)
+          5. win32com WPS Office COM 自动化 (最可靠, 需安装 WPS Office)
+          6. win32com MS Word COM 自动化 (MS Word 可能能打开)
+        """
+        abs_path = os.path.abspath(file_path)
+        fname = os.path.basename(file_path)
+
+        # 方案1: python-docx (新版 .wps = .docx)
+        text = self._parse_wps_via_docx(file_path)
+        if text and text.strip():
+            print(f"   [wps] python-docx 解析成功: {len(text)} 字符")
+            return text
+
+        # 方案2: zipfile 直接提取 XML (新版 .wps)
+        text = self._parse_wps_via_zip(file_path)
+        if text and text.strip():
+            print(f"   [wps] zipfile 解析成功: {len(text)} 字符")
+            return text
+
+        # 方案3: LibreOffice headless 转换 (通用)
+        text = self._parse_doc_via_libreoffice(file_path)
+        if text and text.strip():
+            print(f"   [wps] LibreOffice 解析成功: {len(text)} 字符")
+            return text
+
+        # 方案4: olefile 原始提取 (旧版 .wps OLE2)
+        text = self._parse_doc_via_olefile(file_path)
+        if text and text.strip():
+            print(f"   [wps] olefile 解析成功: {len(text)} 字符 (可能不完整)")
+            return text
+
+        # 方案5: WPS Office COM 自动化 (需安装 WPS Office)
+        text = self._parse_wps_via_wps_com(file_path)
+        if text and text.strip():
+            print(f"   [wps] WPS COM 解析成功: {len(text)} 字符")
+            return text
+
+        # 方案6: MS Word COM (可能兼容某些 .wps)
+        text = self._parse_doc_via_win32(file_path)
+        if text and text.strip():
+            print(f"   [wps] Word COM 解析成功: {len(text)} 字符")
+            return text
+
+        print(f"   [warn] 所有 .wps 解析方案均失败: {fname}")
+        print(f"   [tip] 建议方案: (1) 安装 WPS Office 启用 COM 解析")
+        print(f"         或 (2) 安装 LibreOffice")
+        print(f"         或 (3) 用 WPS 打开后另存为 .docx 格式")
+        return ""
+
+    def _parse_wps_via_docx(self, file_path: str) -> str:
+        """
+        尝试用 python-docx 解析 .wps。
+        新版 WPS 文件本质上是 ZIP + XML，与 .docx 结构相同。
+        """
+        try:
+            import docx
+            doc = docx.Document(file_path)
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            if paragraphs:
+                return "\n".join(paragraphs)
+        except Exception:
+            pass
+        return ""
+
+    def _parse_wps_via_zip(self, file_path: str) -> str:
+        """
+        尝试用 zipfile 直接解压 .wps 并提取 XML 中的文本。
+        新版 WPS 本质是 ZIP 包，内含 word/document.xml 等。
+        作为 python-docx 失败时的备选方案。
+        """
+        import zipfile
+        from xml.etree import ElementTree as ET
+
+        try:
+            with zipfile.ZipFile(file_path, 'r') as z:
+                # 检查是否为有效的 ZIP (新版 WPS 必备特征)
+                if 'word/document.xml' not in z.namelist():
+                    return ""
+
+                # 提取主文档 XML
+                xml_content = z.read('word/document.xml')
+
+                # 从 XML 中提取所有文本节点
+                root = ET.fromstring(xml_content)
+                ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+                texts = []
+                for t in root.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
+                    if t.text:
+                        texts.append(t.text)
+                return "\n".join(texts)
+        except Exception:
+            pass
+        return ""
+
+    def _parse_wps_via_wps_com(self, file_path: str) -> str:
+        """
+        通过 WPS Office COM 自动化提取文本。
+        WPS Office 提供与 MS Word 兼容的 COM 接口 (ProgID: "WPS.Application"
+        或 "KWPS.Application" 或 "ET.Application")。
+        """
+        abs_path = os.path.abspath(file_path)
+        wps = None
+        doc = None
+
+        try:
+            import pythoncom
+            import win32com.client
+        except ImportError:
+            return ""
+
+        # WPS Office 可能的 COM ProgID (按优先级)
+        progids = [
+            "WPS.Application",       # WPS Office 标准安装
+            "KWPS.Application",      # Kingsoft WPS (旧版)
+            "WPS.Document",          # 直接文档对象
+            "Word.Application",      # MS Word (已在上层尝试)
+        ]
+
+        for progid in progids:
+            if progid == "Word.Application":
+                continue  # 已由上层 _parse_doc_via_win32 尝试
+
+            try:
+                pythoncom.CoInitialize()
+                wps = win32com.client.Dispatch(progid)
+                wps.Visible = False
+                wps.DisplayAlerts = 0
+
+                try:
+                    doc = wps.Documents.Open(abs_path, ReadOnly=True, Visible=False)
+                    text = doc.Content.Text
+
+                    if text and text.strip():
+                        return text
+                except Exception:
+                    pass
+                finally:
+                    if doc is not None:
+                        try:
+                            doc.Close(SaveChanges=False)
+                        except Exception:
+                            pass
+                        doc = None
+                    if wps is not None:
+                        try:
+                            wps.Quit()
+                        except Exception:
+                            pass
+                        wps = None
+            except Exception:
+                pass
+            finally:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
         return ""
