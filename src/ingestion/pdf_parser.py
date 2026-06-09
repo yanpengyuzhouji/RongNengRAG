@@ -24,30 +24,51 @@ class PDFParser:
         self.ocr_config = ocr_config or {}
         self._ocr_engine = None
 
+    # 采样参数
+    SAMPLE_PAGES = 15           # 采样前 N 页判断文档类型
+    SCANNED_THRESHOLD = 0.7     # 采样页中 >70% 是扫描件 → 整个文档跳过 fitz
+
     def parse(self, filepath: str) -> dict:
         """
-        解析 PDF 文件
+        解析 PDF 文件 — 两阶段采样策略
+
+        阶段1: 采样前 SAMPLE_PAGES 页判断文档类型
+          - 若 >SCANNED_THRESHOLD 是扫描件 → 跳过全部 fitz，标记为全扫描文档
+          - 否则 → 文字型 PDF，fitz 逐页提取
+
+        阶段2: 按需完成剩余解析
+          - 全扫描件: 直接构建 needs_ocr 列表，不做无效 fitz 提取
+          - 文字型:   继续 fitz 逐页提取，仅对文字量不足的页面标记 OCR
+
         返回:
             {
                 "pages": [{"page_num": 1, "text": "...", "char_count": 150, "needs_ocr": false}],
                 "metadata": {"title": "...", "author": "...", "subject": "..."},
                 "page_count": 10,
                 "total_chars": 5000,
-                "needs_ocr_pages": [3, 5],  # 需要 OCR 的页码
-                "is_scanned": false
+                "needs_ocr_pages": [3, 5],
+                "is_scanned": false,
+                "parse_mode": "fitz" | "ocr_skip_fitz"
             }
         """
         doc = fitz.open(filepath)
+        total_pages = len(doc)
+
         result = {
             "pages": [],
             "metadata": dict(doc.metadata) if doc.metadata else {},
-            "page_count": len(doc),
+            "page_count": total_pages,
             "total_chars": 0,
             "needs_ocr_pages": [],
             "is_scanned": False,
+            "parse_mode": "fitz",
         }
 
-        for page_num in range(len(doc)):
+        # ===== 阶段1: 采样检测文档类型 =====
+        sample_count = min(self.SAMPLE_PAGES, total_pages)
+        scanned_in_sample = 0
+
+        for page_num in range(sample_count):
             page = doc[page_num]
             text = page.get_text("text")
             char_count = len(text.strip())
@@ -63,10 +84,57 @@ class PDFParser:
 
             if page_data["needs_ocr"]:
                 result["needs_ocr_pages"].append(page_num + 1)
+                scanned_in_sample += 1
 
-        # 如果超过 50% 的页面需要 OCR，标记为扫描文档
-        if len(result["needs_ocr_pages"]) > len(doc) * 0.5:
+        # 判断: 采样页中超过阈值是扫描件 → 整个文档当做全扫描件处理
+        is_mostly_scanned = (
+            sample_count > 0 and
+            scanned_in_sample / sample_count >= self.SCANNED_THRESHOLD
+        )
+
+        if is_mostly_scanned:
+            # ===== 阶段2a: 全扫描件模式 → 跳过剩余页的 fitz 提取 =====
             result["is_scanned"] = True
+            result["parse_mode"] = "ocr_skip_fitz"
+
+            # 剩余页面直接标记为 needs_ocr，不调用 fitz
+            for page_num in range(sample_count, total_pages):
+                page_data = {
+                    "page_num": page_num + 1,
+                    "text": "",
+                    "char_count": 0,
+                    "needs_ocr": True,
+                }
+                result["pages"].append(page_data)
+                result["needs_ocr_pages"].append(page_num + 1)
+
+            scanned_count = len(result["needs_ocr_pages"])
+            print(f"   [parse] 检测到全扫描件 PDF ({scanned_count}/{total_pages} 页需 OCR, "
+                  f"采样命中率 {scanned_in_sample}/{sample_count}), "
+                  f"已跳过剩余 {total_pages - sample_count} 页的 fitz 提取")
+
+        else:
+            # ===== 阶段2b: 文字型 PDF → fitz 逐页提取，按需标记 OCR =====
+            for page_num in range(sample_count, total_pages):
+                page = doc[page_num]
+                text = page.get_text("text")
+                char_count = len(text.strip())
+
+                page_data = {
+                    "page_num": page_num + 1,
+                    "text": text.strip(),
+                    "char_count": char_count,
+                    "needs_ocr": char_count < self.min_text_chars,
+                }
+                result["pages"].append(page_data)
+                result["total_chars"] += char_count
+
+                if page_data["needs_ocr"]:
+                    result["needs_ocr_pages"].append(page_num + 1)
+
+            # 超过 50% 需 OCR → 标记为扫描文档
+            if len(result["needs_ocr_pages"]) > total_pages * 0.5:
+                result["is_scanned"] = True
 
         doc.close()
         return result
