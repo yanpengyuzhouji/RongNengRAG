@@ -137,7 +137,41 @@ class GpuMonitor:
 
     def get_free_vram_mb(self) -> int:
         """返回当前空闲显存 (MB)"""
-        return self.get_vram_info()["free_mb"]
+        return self.get_vram_info().get("effective_free_mb",
+                                        self.get_vram_info()["free_mb"])
+
+    def get_system_ram_info(self) -> dict:
+        """获取系统内存信息"""
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            return {
+                "total_gb": round(mem.total / 1024**3, 1),
+                "used_gb": round(mem.used / 1024**3, 1),
+                "free_gb": round(mem.available / 1024**3, 1),
+                "pct": mem.percent,
+            }
+        except ImportError:
+            return {"error": "psutil 未安装"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_disk_space(self, path: str = None) -> dict:
+        """获取磁盘空间，默认检查 OCR 临时目录"""
+        import shutil
+        if path is None:
+            path = os.environ.get("TEMP", "C:/Windows/Temp")
+        try:
+            usage = shutil.disk_usage(path)
+            return {
+                "path": path,
+                "total_gb": round(usage.total / 1024**3, 1),
+                "used_gb": round(usage.used / 1024**3, 1),
+                "free_gb": round(usage.free / 1024**3, 1),
+                "pct": round(usage.used / usage.total * 100, 1),
+            }
+        except Exception as e:
+            return {"error": str(e)}
 
     def is_ollama_busy(self, timeout_s: float = 3.0) -> bool:
         """

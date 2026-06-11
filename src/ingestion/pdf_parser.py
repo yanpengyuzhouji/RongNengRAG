@@ -195,6 +195,7 @@ class PDFParser:
                 use_angle_cls=self.ocr_config.get("use_angle_cls", True),
                 use_gpu=self.ocr_config.get("use_gpu", False),
                 page_delay_ms=self.ocr_config.get("page_delay_ms", 0),
+                ocr_tmp_dir=self.ocr_config.get("ocr_tmp_dir", None),
             )
         return self._ocr_engine
 

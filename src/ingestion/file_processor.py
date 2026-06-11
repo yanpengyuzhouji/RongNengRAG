@@ -585,10 +585,11 @@ class FileProcessor:
         """
         import concurrent.futures
         OCR_BATCH = 15  # 每批 OCR 页数
-        OCR_WORKERS = 2  # 并行 OCR 子进程数
+        OCR_WORKERS = 1  # 并行 OCR 子进程数 (1=安全, 2=峰值11GB差点爆显存)
 
-        # GPU 预算说明: 2×PaddleOCR(~2.5GB each) = 5GB, BGE-M3 等OCR完成后再加载
-        # 背压策略: OCR 期间不加载 BGE-M3，全部OCR完成后再嵌入，避免三端争抢GPU
+        # GPU 预算: PaddleOCR(~3GB), BGE-M3 OCR完成后加载(~2GB), 峰值 ~5GB
+        # 实测: 2 workers = 11.9GB/12GB 爆显存 + WDDM影子吃满RAM
+        #       1 worker  = ~5GB 安全, 时间翻倍但不会炸
 
         parsed = self.pdf_parser.parse(file_path)
         needs_ocr = parsed.get("needs_ocr_pages", [])
@@ -649,6 +650,13 @@ class FileProcessor:
                         all_chunks.extend(bc)
                         total_chars += sum(c.char_count for c in bc)
                         chunk_batches.append(bc)
+
+                    # 每批OCR完成后提示GPU释放
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except: pass
 
                     print(f"   [OCR] {ocr_completed}/{total_batches} "
                           f"(批次{bi + 1}: {len(ocr_texts)}页 → "

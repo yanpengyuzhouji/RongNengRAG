@@ -169,7 +169,9 @@ ocr:
   min_text_chars: 50               # 单页最少文本字符，低于此值触发 OCR
   use_subprocess: true             # 子进程隔离 (避免 protobuf 冲突)
   use_gpu: true                    # ✅ GPU 推理 (CUDA paddlepaddle-gpu)
-                                   #   RTX 4070 SUPER 12GB: ~0.5s/页 vs CPU ~5s/页
+                                   #   RTX 4070 SUPER 12GB: ~5s/页 vs CPU ~15s/页
+  ocr_tmp_dir: "E:/RongNengRAG/data/ocr_tmp"
+                                   # OCR 临时目录 — 避开系统盘
 
   # === CPU 控制 (GPU 模式下忽略) ===
   cpu_threads: 4                   # PaddlePaddle 推理线程数 (GPU 模式下自动忽略)

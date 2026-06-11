@@ -536,7 +536,8 @@ class OCREngine:
                  cpu_threads: int = 0,
                  use_angle_cls: bool = True,
                  use_gpu: bool = False,
-                 page_delay_ms: int = 0):
+                 page_delay_ms: int = 0,
+                 ocr_tmp_dir: str = None):
         """
         Args:
             lang: OCR 语言 ("ch" = 中文)
@@ -546,6 +547,8 @@ class OCREngine:
             use_angle_cls: 文本方向分类 (关闭可大幅降低 CPU)
             use_gpu: 使用 GPU 推理 (需 CUDA paddlepaddle-gpu)
             page_delay_ms: 页面间冷却延迟 (ms)，防止 CPU 持续满载过热
+            ocr_tmp_dir: OCR 临时图片目录 (默认 E:/RongNengRAG/data/ocr_tmp)
+                         必须不在系统盘，避免 C 盘爆满
         """
         self.lang = lang
         self.dpi = dpi
@@ -554,7 +557,9 @@ class OCREngine:
         self.use_angle_cls = use_angle_cls
         self.use_gpu = use_gpu
         self.page_delay_ms = page_delay_ms
+        self.ocr_tmp_dir = ocr_tmp_dir or r"E:\RongNengRAG\data\ocr_tmp"
         self._ocr_instance = None  # 直接模式下的缓存
+        os.makedirs(self.ocr_tmp_dir, exist_ok=True)
 
     def _get_ocr(self):
         """获取 OCR 实例（直接模式，需 PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python）"""
@@ -610,7 +615,7 @@ class OCREngine:
         Args:
             pdf_path: PDF 文件路径
             pages: 需要 OCR 的页码列表 (0-based)
-            tmp_dir: 临时图片目录 (默认系统临时目录)
+            tmp_dir: 临时图片目录 (默认 self.ocr_tmp_dir, E盘)
 
         Returns:
             {"success": bool, "text": str, "pages": {...}, "elapsed_ms": float}
@@ -619,7 +624,8 @@ class OCREngine:
             return {"success": True, "text": "", "pages": {}, "total_pages_ocr": 0, "elapsed_ms": 0}
 
         if self.use_subprocess:
-            return self._ocr_pdf_subprocess(pdf_path, pages, tmp_dir)
+            return self._ocr_pdf_subprocess(pdf_path, pages,
+                                            tmp_dir or self.ocr_tmp_dir)
 
         # GPU 模式背压
         if self.use_gpu:
@@ -687,7 +693,7 @@ class OCREngine:
         try:
             proc = subprocess.run(
                 cmd,
-                capture_output=True, encoding="utf-8", timeout=120,
+                capture_output=True, encoding="utf-8", errors="replace", timeout=120,
                 env=env,
                 cwd=str(script.parent.parent.parent),  # 项目根目录
             )
@@ -795,7 +801,7 @@ class OCREngine:
                     proc = subprocess.run(
                         batch_cmd,
                         input=img_list_json,
-                        capture_output=True, encoding="utf-8",
+                        capture_output=True, encoding="utf-8", errors="replace",
                         timeout=chunk_timeout,
                         env=env,
                         cwd=str(script.parent.parent.parent),
@@ -829,7 +835,7 @@ class OCREngine:
                         try:
                             proc = subprocess.run(
                                 single_cmd_base + [img_path],
-                                capture_output=True, encoding="utf-8",
+                                capture_output=True, encoding="utf-8", errors="replace",
                                 timeout=180, env=env,
                                 cwd=str(script.parent.parent.parent),
                             )
