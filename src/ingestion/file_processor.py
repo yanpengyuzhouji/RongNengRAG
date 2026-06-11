@@ -207,11 +207,25 @@ class FileProcessor:
                               status="processing")
 
         try:
-            # ===== Step 1: 解析 (25%) =====
+            # ===== Step 1: 解析 =====
             if progress_callback:
                 progress_callback("解析文件", 0.0)
 
             file_meta = self._build_file_meta(file_path, file_hash, domain, category)
+            file_ext_lower = file_meta.get("extension", "").lower()
+
+            # PDF + OCR 场景: 渐进入库，避免全部OCR完才嵌入
+            if file_ext_lower == ".pdf" and not file_meta.get("is_drawing"):
+                ocr_cfg = self.config.get("ocr", {})
+                if ocr_cfg.get("enabled"):
+                    result = self._process_pdf_progressive(
+                        file_path, file_meta, file_hash, file_name,
+                        file_size, file_ext, result, progress_callback
+                    )
+                    if result is not None:
+                        return result  # 已处理完成（成功或失败）
+
+            # 通用路径: 解析 → 嵌入 → 入库
             chunks = self._parse_file(file_path, file_meta)
             result.chunks_created = len(chunks)
             result.chars_extracted = sum(c.char_count for c in chunks)
@@ -231,54 +245,15 @@ class FileProcessor:
             if progress_callback:
                 progress_callback("解析文件", 1.0)
 
-            # ===== Step 2: 嵌入 (50%) =====
+            # ===== Step 2: 嵌入 =====
             if progress_callback:
                 progress_callback("生成嵌入向量", 0.0)
 
-            if self.embedder is None:
-                self.embedder = Embedder(self.config_path)
-
-            embedding_texts = [create_text_for_embedding(chunk) for chunk in chunks]
-            emb_result = self.embedder.encode(embedding_texts, show_progress=False)
-            t_embed = (time.time() - t_start) * 1000 - t_parse
-            result.embed_time_ms = t_embed
-
-            if progress_callback:
-                progress_callback("生成嵌入向量", 1.0)
-
-            # ===== Step 3: 入库 (25%) =====
-            if progress_callback:
-                progress_callback("写入向量库", 0.0)
-
-            # 先删除旧索引 (如果存在)
-            self.store.delete_by_file_hash(file_hash)
-
-            self.store.insert(
-                chunks=chunks,
-                dense_vectors=emb_result.dense_vectors,
-                sparse_vectors=emb_result.sparse_vectors,
-                embedding_texts=embedding_texts,
-                batch_size=min(500, len(chunks)),
+            result = self._embed_and_insert(
+                chunks, result, file_hash, file_name, file_path,
+                file_size, file_ext, t_start, progress_callback
             )
-
-            if progress_callback:
-                progress_callback("写入向量库", 1.0)
-
-            # ===== 标记完成 =====
-            result.status = FileStatus.COMPLETED
-            result.total_time_ms = (time.time() - t_start) * 1000
-
-            self._upsert_registry(
-                file_hash, file_name, file_path, file_size, file_ext,
-                status="completed",
-                chunks_count=len(chunks),
-                chars_count=result.chars_extracted,
-                domain=result.domain,
-                category=result.category,
-                doc_number=result.doc_number,
-                parse_time=result.parse_time_ms,
-                embed_time=result.embed_time_ms,
-            )
+            return result
 
         except Exception as e:
             result.status = FileStatus.FAILED
@@ -333,12 +308,13 @@ class FileProcessor:
             total_time_ms=(time.time() - t_start) * 1000,
         )
 
-    def delete(self, identifier: str) -> bool:
+    def delete(self, identifier: str, remove_file: bool = False) -> bool:
         """
         从向量库中删除文件
 
         Args:
             identifier: 文件 hash 或文件路径
+            remove_file: 是否同时删除物理文件（仅限 uploads 目录下的文件）
 
         Returns:
             是否成功
@@ -347,12 +323,93 @@ class FileProcessor:
         if not file_hash:
             return False
 
+        # 获取注册表信息（用于后续清理物理文件）
+        reg = self._get_registry(file_hash)
+
         # Milvus 删除
         self.store.delete_by_file_hash(file_hash)
+
+        # 清理物理文件（安全策略：仅删除 uploads 目录下的文件）
+        if remove_file and reg:
+            file_path = reg.get("original_path") or reg.get("stored_path") or ""
+            if file_path and os.path.exists(file_path):
+                try:
+                    uploads_abs = str(self.uploads_dir.resolve())
+                    file_abs = str(Path(file_path).resolve())
+                    if file_abs.startswith(uploads_abs):
+                        os.remove(file_path)
+                except Exception:
+                    pass
 
         # 注册表标记
         self._upsert_registry(file_hash, status="deleted")
         return True
+
+    def sync_orphans(self, dry_run: bool = False) -> dict:
+        """
+        扫描注册表中指向不存在物理文件的孤记录，清理向量 + 标记 deleted
+
+        Args:
+            dry_run: True 只扫描不清理
+
+        Returns:
+            {total_checked, orphan_count, cleaned, errors, orphans (仅 dry_run)}
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM file_registry WHERE status NOT IN ('deleted', 'pending', 'processing')"
+        )
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+
+        orphans = []
+        for row in rows:
+            file_path = row.get("original_path") or row.get("stored_path") or ""
+            if not file_path or not os.path.exists(file_path):
+                orphans.append(row)
+
+        if dry_run:
+            return {
+                "total_checked": len(rows),
+                "orphan_count": len(orphans),
+                "orphans": [
+                    {
+                        "file_name": o.get("file_name", ""),
+                        "file_hash": o.get("file_hash", ""),
+                        "original_path": o.get("original_path", "") or o.get("stored_path", ""),
+                        "chunks_count": o.get("chunks_count", 0),
+                        "domain": o.get("domain", ""),
+                        "category": o.get("category", ""),
+                    }
+                    for o in orphans
+                ],
+                "cleaned": 0,
+            }
+
+        cleaned = 0
+        errors = []
+        for row in orphans:
+            file_hash = row.get("file_hash")
+            file_name = row.get("file_name", "")
+            try:
+                self.store.delete_by_file_hash(file_hash)
+                self._upsert_registry(file_hash, status="deleted")
+                cleaned += 1
+            except Exception as e:
+                errors.append({
+                    "file_name": file_name,
+                    "file_hash": file_hash,
+                    "error": str(e),
+                })
+
+        return {
+            "total_checked": len(rows),
+            "orphan_count": len(orphans),
+            "cleaned": cleaned,
+            "errors": errors,
+        }
 
     def reindex(self, identifier: str,
                 progress_callback: Callable = None) -> ProcessResult:
@@ -389,8 +446,13 @@ class FileProcessor:
         return self.process(file_path, progress_callback=progress_callback)
 
     def list_files(self, status: str = None, domain: str = None,
-                   limit: int = 100, offset: int = 0) -> List[dict]:
-        """列出已注册的文件"""
+                   limit: int = 100, offset: int = 0,
+                   check_existence: bool = True) -> List[dict]:
+        """列出已注册的文件
+
+        Args:
+            check_existence: 检查物理文件是否存在，添加 file_exists 字段
+        """
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -410,6 +472,17 @@ class FileProcessor:
         cursor.execute(query, params)
         rows = [dict(row) for row in cursor.fetchall()]
         conn.close()
+
+        # 检测物理文件是否存在
+        for row in rows:
+            file_path = (row.get("original_path") or row.get("stored_path") or "")
+            if file_path and os.path.exists(file_path):
+                row["file_exists"] = True
+            elif file_path and not os.path.exists(file_path):
+                row["file_exists"] = False
+            else:
+                row["file_exists"] = None  # 无路径信息
+
         return rows
 
     def get_summary(self) -> dict:
@@ -492,6 +565,250 @@ class FileProcessor:
 
         conn.commit()
         conn.close()
+
+    def _process_pdf_progressive(self, file_path, file_meta, file_hash, file_name,
+                                  file_size, file_ext, result: ProcessResult,
+                                  progress_callback=None) -> Optional[ProcessResult]:
+        """
+        PDF 双槽并行入库 — 2个OCR子进程 + 1个嵌入线程 同时跑
+
+        GPU预算 (12GB):
+          2×PaddleOCR(~3GB each) + BGE-M3(~2GB) = ~8GB ✓
+
+        调度策略:
+          - 全部OCR批次提交到2-worker线程池
+          - 嵌入线程独立消费完成队列
+          - OCR并行度: 2 (两个子进程同时跑不同页)
+          - 损坏恢复: 文件标记 processing, _parse失败时 delete_by_file_hash
+
+        时间: 138页全扫描 2×15页/批×~75s → ~5批/worker×~75s = ~375s (vs 串行750s)
+        """
+        import concurrent.futures
+        import threading
+        import queue
+        OCR_BATCH = 15  # 每批 OCR 页数
+        OCR_WORKERS = 2  # 并行 OCR 子进程数
+
+        parsed = self.pdf_parser.parse(file_path)
+        needs_ocr = parsed.get("needs_ocr_pages", [])
+        if not needs_ocr:
+            return None
+
+        ocr_pages_0based = [p - 1 for p in needs_ocr]
+        total_ocr = len(ocr_pages_0based)
+        t_start = time.time()
+
+        # 收集非OCR页文本
+        non_ocr_pages = [p for p in parsed.get("pages", [])
+                         if not p.get("needs_ocr")]
+        all_chunks = []
+        total_chars = 0
+        if non_ocr_pages:
+            non_ocr_text = "\n\n".join(p.get("text", "") for p in non_ocr_pages)
+            if non_ocr_text.strip():
+                nc = self.chunker.chunk_text_document(non_ocr_text, file_meta)
+                all_chunks.extend(nc)
+                total_chars += sum(c.char_count for c in nc)
+
+        # 预建所有 OCR 批次
+        batches = [
+            ocr_pages_0based[i:i + OCR_BATCH]
+            for i in range(0, total_ocr, OCR_BATCH)
+        ]
+        total_batches = len(batches)
+
+        # 嵌入队列：OCR线程放入 (batch_idx, chunks)，嵌入线程消费
+        embed_queue = queue.Queue(maxsize=total_batches + 1)
+        embed_total_ms = [0.0]  # 用list做可变引用
+        embed_done = threading.Event()
+        all_inserted = threading.Event()
+
+        def _ensure_embedder():
+            if self.embedder is None:
+                self._wait_for_gpu_slot("BGE-M3 嵌入模型加载")
+                self.embedder = Embedder(self.config_path)
+
+        def _embed_worker():
+            """嵌入线程：从队列取chunks，编码+写入Milvus"""
+            _ensure_embedder()
+            batch_order = []  # 记录嵌入顺序以便日志
+            while True:
+                item = embed_queue.get()
+                if item is None:  # 毒丸信号
+                    break
+                bc = item
+                batch_order.append(len(bc))
+                t0 = time.time()
+                texts = [create_text_for_embedding(c) for c in bc]
+                emb = self.embedder.encode(texts, show_progress=False)
+                self.store.insert(
+                    chunks=bc, dense_vectors=emb.dense_vectors,
+                    sparse_vectors=emb.sparse_vectors,
+                    embedding_texts=texts, batch_size=min(500, len(bc)),
+                )
+                embed_total_ms[0] += (time.time() - t0) * 1000
+                embed_queue.task_done()
+            embed_done.set()
+
+        def _run_ocr_safe(pages_0based):
+            """OCR子进程包装，异常转返回空dict"""
+            try:
+                return self.pdf_parser.ocr_pages(file_path, pages_0based)
+            except Exception as e:
+                print(f"   [OCR] 子进程异常: {e}")
+                return {}
+
+        # 清理旧索引
+        self.store.delete_by_file_hash(file_hash)
+
+        # 启动嵌入线程
+        embed_thread = threading.Thread(target=_embed_worker, daemon=True)
+        embed_thread.start()
+
+        try:
+            # 提交所有OCR批次到2-worker池
+            ocr_completed = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=OCR_WORKERS) as pool:
+                futures = {}
+                for bi, bp in enumerate(batches):
+                    f = pool.submit(_run_ocr_safe, bp)
+                    futures[f] = bi
+
+                completed = {}
+                for future in concurrent.futures.as_completed(futures):
+                    bi = futures[future]
+                    ocr_texts = future.result()
+                    ocr_completed += 1
+
+                    # 分块
+                    batch_text = "\n\n".join(ocr_texts.values())
+                    if batch_text.strip():
+                        bc = self.chunker.chunk_text_document(batch_text, file_meta)
+                        all_chunks.extend(bc)
+                        total_chars += sum(c.char_count for c in bc)
+                        completed[bi] = bc
+                        # 放入嵌入队列（嵌入线程并行消费）
+                        embed_queue.put(bc)
+
+                    print(f"   [OCR] {ocr_completed}/{total_batches} 完成 "
+                          f"(批次{bi + 1}: {len(ocr_texts)}页 → "
+                          f"{len(completed.get(bi, []))}chunks, "
+                          f"{(time.time() - t_start):.0f}s)")
+
+                    if progress_callback:
+                        progress_callback(
+                            f"OCR ({ocr_completed}/{total_batches})",
+                            ocr_completed / (total_batches + 1)
+                        )
+
+            # 所有OCR完成，通知嵌入线程退出
+            embed_queue.put(None)
+            embed_thread.join(timeout=120)
+
+        except Exception as e:
+            # 中断时清理已插入的chunks
+            print(f"   [ERR] 入库中断: {e}")
+            try:
+                embed_queue.put(None)  # 停止嵌入线程
+                embed_thread.join(timeout=10)
+                self.store.delete_by_file_hash(file_hash)
+            except Exception:
+                pass
+            raise
+
+        # 标记完成
+        if not all_chunks:
+            result.status = FileStatus.FAILED
+            result.error_message = "解析后无有效文本内容 (OCR全部失败)"
+            self._upsert_registry(file_hash, file_name, file_path, file_size,
+                                  file_ext, status="failed",
+                                  error=result.error_message)
+            return result
+
+        result.chunks_created = len(all_chunks)
+        result.chars_extracted = total_chars
+        result.domain = file_meta.get("domain", "")
+        result.category = file_meta.get("category", "")
+        result.doc_number = file_meta.get("doc_number", "")
+        result.parse_time_ms = (time.time() - t_start) * 1000
+        result.embed_time_ms = embed_total_ms[0]
+        result.status = FileStatus.COMPLETED
+        result.total_time_ms = (time.time() - t_start) * 1000
+
+        self._upsert_registry(
+            file_hash, file_name, file_path, file_size, file_ext,
+            status="completed", chunks_count=result.chunks_created,
+            chars_count=result.chars_extracted, domain=result.domain,
+            category=result.category, doc_number=result.doc_number,
+            parse_time=result.parse_time_ms, embed_time=result.embed_time_ms,
+        )
+        return result
+
+    def _embed_and_insert(self, chunks, result: ProcessResult,
+                          file_hash, file_name, file_path, file_size, file_ext,
+                          t_start, progress_callback=None) -> ProcessResult:
+        """嵌入 + 入库 + 标记完成"""
+        if self.embedder is None:
+            self._wait_for_gpu_slot("BGE-M3 嵌入模型加载")
+            self.embedder = Embedder(self.config_path)
+
+        if progress_callback:
+            progress_callback("生成嵌入向量", 0.0)
+
+        t_embed = time.time()
+        embedding_texts = [create_text_for_embedding(chunk) for chunk in chunks]
+        emb_result = self.embedder.encode(embedding_texts, show_progress=False)
+        result.embed_time_ms = (time.time() - t_embed) * 1000
+
+        if progress_callback:
+            progress_callback("生成嵌入向量", 1.0)
+
+        if progress_callback:
+            progress_callback("写入向量库", 0.0)
+
+        self.store.delete_by_file_hash(file_hash)
+        self.store.insert(
+            chunks=chunks,
+            dense_vectors=emb_result.dense_vectors,
+            sparse_vectors=emb_result.sparse_vectors,
+            embedding_texts=embedding_texts,
+            batch_size=min(500, len(chunks)),
+        )
+
+        if progress_callback:
+            progress_callback("写入向量库", 1.0)
+
+        result.status = FileStatus.COMPLETED
+        result.total_time_ms = (time.time() - t_start) * 1000
+
+        self._upsert_registry(
+            file_hash, file_name, file_path, file_size, file_ext,
+            status="completed",
+            chunks_count=len(chunks),
+            chars_count=result.chars_extracted,
+            domain=result.domain,
+            category=result.category,
+            doc_number=result.doc_number,
+            parse_time=result.parse_time_ms,
+            embed_time=result.embed_time_ms,
+        )
+        return result
+
+    def _wait_for_gpu_slot(self, task_name: str = "入库", min_free_mb: int = 2500):
+        """GPU 显存背压 — 等待足够显存后再执行操作"""
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+            from utils.gpu_monitor import get_gpu_monitor
+            monitor = get_gpu_monitor(min_free_vram_mb=min_free_mb)
+            ok = monitor.wait_for_vram(min_free_mb=min_free_mb)
+            if not ok:
+                print(f"   [WARN] [{task_name}] 显存等待超时，强制执行")
+            return ok
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        return True
 
     def _resolve_hash(self, identifier: str) -> Optional[str]:
         """从文件路径或 hash 解析为 hash"""
@@ -627,9 +944,41 @@ class FileProcessor:
             try:
                 import docx
                 doc = docx.Document(file_path)
-                text = "\n".join([p.text for p in doc.paragraphs])
+
+                # 提取段落文本
+                para_text = "\n".join([p.text for p in doc.paragraphs])
+
+                # 提取表格内容（电力规范docx大量信息在表格中）
+                table_parts = []
+                for ti, table in enumerate(doc.tables):
+                    rows_text = []
+                    for row in table.rows:
+                        cells = []
+                        for cell in row.cells:
+                            cell_text = " ".join(p.text for p in cell.paragraphs if p.text.strip())
+                            if cell_text:
+                                cells.append(cell_text)
+                        if cells:
+                            rows_text.append(" | ".join(cells))
+                    if rows_text:
+                        table_parts.append(
+                            f"[表格{ti + 1}]\n" + "\n".join(rows_text)
+                        )
+
+                text = para_text
+                if table_parts:
+                    text += "\n\n" + "\n\n".join(table_parts)
+
+                if not text.strip():
+                    return []
+
                 return self.chunker.chunk_text_document(text, file_meta)
-            except Exception:
+
+            except ImportError:
+                print(f"   [warn] python-docx 未安装，无法解析 .docx: {file_path}")
+                return []
+            except Exception as e:
+                print(f"   [warn] .docx 解析失败: {Path(file_path).name}: {e}")
                 return []
 
         # TXT / MD

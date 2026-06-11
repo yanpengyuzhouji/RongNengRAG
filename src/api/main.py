@@ -60,6 +60,8 @@ async def startup():
     print(f"[startup] 向量库路径: {cfg['paths']['milvus_db']}")
 
     # 预热嵌入模型和重排序模型(避免首次请求等待)
+    # 注意: OCR 不在启动时预热 — PaddleOCR 3个子模型 ~3-4GB 显存，
+    #   与 BGE-M3(~2GB) + BGE-Reranker(~2GB) 同时加载会撑爆 12GB 显存
     import threading
     def warmup():
         print("[startup] 预热嵌入模型...")
@@ -69,27 +71,6 @@ async def startup():
             print("[startup] 嵌入+重排序模型预热完成")
         except Exception as ex:
             print(f"[startup] 模型预热跳过: {ex}")
-
-        # 预热 OCR 引擎 (子进程隔离, 首次加载约 10-15s)
-        ocr_cfg = cfg.get("ocr", {})
-        if ocr_cfg.get("enabled"):
-            print("[startup] 预热 OCR 模型 (PaddleOCR)...")
-            try:
-                from ingestion.ocr_engine import OCREngine
-                import tempfile, os
-                # 创建最小测试图片触发模型加载
-                from PIL import Image, ImageDraw
-                img = Image.new('RGB', (200, 60), color='white')
-                draw = ImageDraw.Draw(img)
-                draw.text((10, 20), 'OCR预热测试', fill='black')
-                tmp = os.path.join(tempfile.gettempdir(), '_ocr_warmup.png')
-                img.save(tmp)
-                engine = OCREngine(use_subprocess=True)
-                _ = engine.ocr_page(tmp)
-                os.remove(tmp)
-                print("[startup] OCR 模型预热完成")
-            except Exception as ex:
-                print(f"[startup] OCR 预热跳过: {ex}")
     threading.Thread(target=warmup, daemon=True).start()
 
 # 全局实例 (延迟加载)
@@ -472,13 +453,30 @@ async def get_file_detail(identifier: str):
 
 
 @app.delete("/files/{identifier}")
-async def delete_file(identifier: str):
-    """删除已入库文件 (从向量库中移除)"""
+async def delete_file(
+    identifier: str,
+    remove_file: bool = Query(default=True, description="是否同时删除物理文件"),
+):
+    """删除已入库文件 (从向量库中移除，可选清理物理文件)"""
     processor = get_processor()
-    ok = processor.delete(identifier)
+    ok = processor.delete(identifier, remove_file=remove_file)
     if not ok:
         raise HTTPException(status_code=404, detail="文件未找到")
     return {"status": "deleted", "identifier": identifier}
+
+
+@app.post("/files/sync")
+async def sync_files(dry_run: bool = Query(default=False, description="仅扫描不清理")):
+    """
+    一致性校验：扫描注册表中物理文件已消失的孤记录，
+    自动从向量库和注册表清理
+
+    - dry_run=false: 执行清理
+    - dry_run=true: 仅返回孤记录列表，不执行删除
+    """
+    processor = get_processor()
+    result = processor.sync_orphans(dry_run=dry_run)
+    return result
 
 
 @app.post("/files/{identifier}/reindex", response_model=UploadResponse)
@@ -513,7 +511,8 @@ async def list_files(
     """列出已入库文件"""
     processor = get_processor()
     files = processor.list_files(status=status, domain=domain, limit=limit, offset=offset)
-    return {"count": len(files), "files": files}
+    missing_count = sum(1 for f in files if f.get("file_exists") is False)
+    return {"count": len(files), "files": files, "missing_count": missing_count}
 
 
 @app.get("/files/summary", response_model=SummaryResponse)
@@ -536,6 +535,22 @@ async def get_stats():
     r = get_retriever()
     s = r.store.get_collection_stats()
     return {"collection_exists": s["exists"], "chunk_count": s.get("count", 0)}
+
+
+@app.get("/gpu")
+async def get_gpu_status():
+    """GPU 显存状态"""
+    try:
+        from utils.gpu_monitor import get_gpu_monitor
+        m = get_gpu_monitor()
+        vram = m.get_vram_info()
+        return {
+            **vram,
+            "usage_pct": round(vram["used_mb"] / vram["total_mb"] * 100, 1) if vram["total_mb"] else 0,
+            "ollama_busy": m.is_ollama_busy(),
+        }
+    except ImportError:
+        return {"error": "GPU 监控未安装 (pip install nvidia-ml-py)"}
 
 
 @app.post("/search", response_model=SearchAPIResponse)

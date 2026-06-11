@@ -165,9 +165,28 @@ ocr:
   enabled: true                    # 是否启用 OCR (扫描件识别)
   provider: "paddleocr"            # PaddleOCR (子进程隔离)
   lang: "ch"                       # 语言: ch=中文
-  dpi: 200                         # PDF 渲染 DPI (越大越清晰)
+  dpi: 150                         # PDF 渲染 DPI (越大越清晰，越慢)
   min_text_chars: 50               # 单页最少文本字符，低于此值触发 OCR
   use_subprocess: true             # 子进程隔离 (避免 protobuf 冲突)
+  use_gpu: true                    # ✅ GPU 推理 (CUDA paddlepaddle-gpu)
+                                   #   RTX 4070 SUPER 12GB: ~0.5s/页 vs CPU ~5s/页
+
+  # === CPU 控制 (GPU 模式下忽略) ===
+  cpu_threads: 4                   # PaddlePaddle 推理线程数 (GPU 模式下自动忽略)
+  page_delay_ms: 0                 # GPU 模式下无需冷却延迟
+  use_angle_cls: true              # 文本方向分类 (旋转校正)
+
+  # === GPU 显存管理 (LLM 优先策略) ===
+  gpu_memory:
+    min_free_vram_mb: 2500         # 入库所需最小空闲显存 (MB)
+                                   #   RTX 4070 SUPER 12GB:
+                                   #     ~2GB BGE-M3 (常驻)
+                                   #     ~1.5GB PaddleOCR (按需)
+                                   #     ~4GB Ollama qwen3.5:4b (独立进程)
+                                   #     ~2GB BGE-Reranker (按需)
+                                   #   留 2.5GB buffer 供 LLM 峰值使用
+    poll_interval_s: 5             # 显存轮询间隔 (秒)
+    max_wait_s: 600                # 最大等待时间 (秒)，超时强制执行
 
 # ===== 嵌入模型配置 =====
 embedding:

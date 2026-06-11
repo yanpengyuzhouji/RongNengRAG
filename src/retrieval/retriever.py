@@ -145,6 +145,7 @@ class Retriever:
         # ===== 阶段2: 交叉编码器精排 =====
         if len(candidates) <= top_k:
             ranked = candidates
+            reranker_used = False
         else:
             try:
                 ranked = self.reranker.rerank(
@@ -153,6 +154,7 @@ class Retriever:
                     analyzed_query=aq,
                     top_k=top_k,
                 )
+                reranker_used = True
             except Exception as e:
                 print(f"[warn] 重排序失败，回退元数据排序: {e}")
                 ranked = self.reranker.rerank_without_model(
@@ -160,6 +162,7 @@ class Retriever:
                     analyzed_query=aq,
                     top_k=top_k,
                 )
+                reranker_used = False
 
         # ===== 构建响应 =====
         results = []
@@ -188,6 +191,10 @@ class Retriever:
             ))
 
         elapsed = (time.time() - t_start) * 1000
+
+        # 用后即卸：释放重排序模型 (~2GB 显存)，下次搜索时按需重载
+        if reranker_used:
+            self.reranker.unload()
 
         return SearchResponse(
             query=query,

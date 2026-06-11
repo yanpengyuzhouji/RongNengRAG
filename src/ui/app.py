@@ -330,16 +330,22 @@ def _build_file_tree(files: list) -> str:
         by_domain[dm][cat].append(f)
 
     domain_emoji = {"变电": "B", "配电": "P", "送电输电": "S", "综合": "Z", "未分类": "?"}
-    status_icon = {"completed": "O", "processing": ".", "failed": "X", "deleted": "D"}
+    status_icon = {
+        "completed": "O", "processing": ".", "failed": "X", "deleted": "D",
+    }
+    missing_icon = "~"  # 物理文件已丢失
 
     total_files = len(files)
     total_chunks = sum(f.get("chunks_count", 0) for f in files)
+    missing_count = sum(1 for f in files if f.get("file_exists") is False)
 
     lines = [
         f"## 文件管理",
         f"**{total_files}** 个文件 | **{total_chunks}** 个chunks",
-        f"---",
     ]
+    if missing_count > 0:
+        lines.append(f"*[WARN] {missing_count} 个文件的物理文件已丢失 — 点击「清理失效文件」移除*")
+    lines.append("---")
 
     for dm in sorted(by_domain.keys()):
         cats = by_domain[dm]
@@ -354,10 +360,13 @@ def _build_file_tree(files: list) -> str:
             for f in cat_files:
                 st = f.get("status", "?")
                 icon = status_icon.get(st, "?")
+                if f.get("file_exists") is False:
+                    icon = missing_icon
                 fname = f.get("file_name", "?")[:60]
                 chunks = f.get("chunks_count", 0)
                 created = f.get("created_at", "")[:10] if f.get("created_at") else ""
-                lines.append(f"- `[{icon}]` {fname} | chunks:{chunks} | {created}")
+                missing_note = " [文件丢失]" if f.get("file_exists") is False else ""
+                lines.append(f"- `[{icon}]` {fname}{missing_note} | chunks:{chunks} | {created}")
         lines.append("")
 
     lines.append(f"---\n*刷新时间: {time.strftime('%H:%M:%S')}*")
@@ -421,7 +430,7 @@ def delete_selected(file_id: str):
     if not file_id or not file_id.strip():
         return "[WARN] 请先选择一个文件", gr.update(), gr.update()
 
-    result = _api("DELETE", f"/files/{file_id.strip()}")
+    result = _api("DELETE", f"/files/{file_id.strip()}?remove_file=true")
     if isinstance(result, str):
         return result, gr.update(), gr.update()
 
@@ -438,6 +447,61 @@ def delete_selected(file_id: str):
         choices.append((label, f.get("file_hash", "")))
 
     return f"[OK] 已删除: {file_id[:16]}...", tree, gr.update(choices=choices, value=None)
+
+
+def sync_orphan_files(do_clean: bool):
+    """
+    一致性校验 — 扫描并清理注册表中指向不存在物理文件的孤记录
+    do_clean=False: 仅扫描 (dry run)
+    do_clean=True: 扫描并清理向量库
+    """
+    endpoint = "/files/sync?dry_run=false" if do_clean else "/files/sync?dry_run=true"
+    result = _api("POST", endpoint)
+
+    if isinstance(result, str):
+        return f"[ERROR] {result}", gr.update(), gr.update()
+
+    dry = not do_clean
+    checked = result.get("total_checked", 0)
+    orphan_count = result.get("orphan_count", 0)
+    cleaned = result.get("cleaned", 0)
+
+    lines = []
+    if dry:
+        lines.append(f"### [扫描结果] 发现 {orphan_count} 个失效文件（共检查 {checked} 个）")
+    else:
+        lines.append(f"### [清理完成] 已清理 {cleaned}/{orphan_count} 个失效文件（共检查 {checked} 个）")
+
+    if "errors" in result and result["errors"]:
+        lines.append(f"\n**清理异常：**")
+        for e in result["errors"]:
+            lines.append(f"- `[X]` {e['file_name']}: {e['error']}")
+
+    if "orphans" in result and result["orphans"]:
+        lines.append(f"\n**失效文件详情：**")
+        for o in result["orphans"]:
+            fname = o.get("file_name", "?")[:50]
+            domain = o.get("domain", "") or "未分类"
+            cat = o.get("category", "") or "未分类"
+            chunks = o.get("chunks_count", 0)
+            path = o.get("original_path", "")[:60]
+            lines.append(f"- `[orphan]` {fname} | {domain}/{cat} | chunks:{chunks}")
+            lines.append(f"  *原路径: {path}*")
+
+    # Scan or clean完成后刷新文件列表
+    api_result = _api("GET", "/files", params={"limit": 500, "offset": 0})
+    if isinstance(api_result, str):
+        files = []
+    else:
+        files = [f for f in api_result.get("files", []) if f.get("status") != "deleted"]
+
+    tree = _build_file_tree(files)
+    choices = []
+    for f in sorted(files, key=lambda x: x.get("file_name", "")):
+        label = f"{f.get('file_name','?')[:50]} [{f.get('chunks_count',0)}c]"
+        choices.append((label, f.get("file_hash", "")))
+
+    return "\n".join(lines), tree, gr.update(choices=choices, value=None)
 
 
 # ========== 文档检索 ==========
@@ -661,6 +725,11 @@ with gr.Blocks(title="榕能电力审图知识库 RAG", theme=gr.themes.Soft(), 
                     with gr.Row():
                         view_btn = gr.Button("查看详情")
                         delete_btn = gr.Button("删除文件", variant="stop")
+                    gr.Markdown("---")
+                    gr.Markdown("### 一致性维护")
+                    with gr.Row():
+                        scan_orphan_btn = gr.Button("扫描失效文件", variant="secondary", size="sm")
+                        clean_orphan_btn = gr.Button("清理失效文件", variant="stop", size="sm")
                     op_result = gr.Markdown("")
 
             refresh_btn.click(fn=refresh_file_list,
@@ -668,6 +737,10 @@ with gr.Blocks(title="榕能电力审图知识库 RAG", theme=gr.themes.Soft(), 
                 outputs=[file_tree, file_selector])
             view_btn.click(fn=view_file_details, inputs=[file_selector], outputs=[file_detail])
             delete_btn.click(fn=delete_selected, inputs=[file_selector],
+                outputs=[op_result, file_tree, file_selector])
+            scan_orphan_btn.click(fn=lambda: sync_orphan_files(False),
+                outputs=[op_result, file_tree, file_selector])
+            clean_orphan_btn.click(fn=lambda: sync_orphan_files(True),
                 outputs=[op_result, file_tree, file_selector])
 
             demo.load(fn=refresh_file_list,

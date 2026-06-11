@@ -191,6 +191,10 @@ class PDFParser:
                 lang=self.ocr_config.get("lang", "ch"),
                 dpi=self.ocr_config.get("dpi", 200),
                 use_subprocess=self.ocr_config.get("use_subprocess", True),
+                cpu_threads=self.ocr_config.get("cpu_threads", 0),
+                use_angle_cls=self.ocr_config.get("use_angle_cls", True),
+                use_gpu=self.ocr_config.get("use_gpu", False),
+                page_delay_ms=self.ocr_config.get("page_delay_ms", 0),
             )
         return self._ocr_engine
 

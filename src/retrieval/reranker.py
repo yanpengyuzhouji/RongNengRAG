@@ -71,6 +71,20 @@ class Reranker:
 
         self._loaded = True
 
+    def unload(self):
+        """释放重排序模型显存 — LLM/OCR 按需调度"""
+        if not self._loaded:
+            return
+        try:
+            del self.model
+            self.model = None
+            self._loaded = False
+            import torch
+            torch.cuda.empty_cache()
+            print("   [rerank] 模型已卸载，显存已释放")
+        except Exception as e:
+            print(f"   [rerank] 卸载异常: {e}")
+
     def _load_flag_reranker(self):
         print(f"[rerank] 加载本地交叉编码器: {self.model_name}")
         try:
