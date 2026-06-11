@@ -1,5 +1,88 @@
 # 开发日志
 
+## 2026-06-11
+
+### GPU 显存感知调度 — OCR双槽并行 + 嵌入流水线 + Reranker按需卸载
+
+- **新增** `src/utils/gpu_monitor.py` — GPU 显存监控器:
+  - 基于 pynvml 实时检测 GPU 显存使用
+  - `is_ollama_busy()` 检测 Ollama 是否正在推理（/api/ps 端点）
+  - `wait_for_vram(min_free_mb)` 背压等待：显存不足时检查 Ollama 状态，LLM 繁忙则等待释放，LLM 空闲则短等后强制执行
+  - 全局单例 `get_gpu_monitor()`
+
+- **重构** `src/ingestion/ocr_engine.py` — OCR 引擎完整重写:
+  - **stdout/stderr 分离**: CLI 入口将 sys.stdout 重定向到 stderr，JSON 输出通过 `_orig_stdout_fd` 写原始文件描述符，彻底解决 PaddleOCR 初始化日志污染 JSON
+  - **PaddleOCR 2.x/3.x 兼容**: 同时支持旧版二元组 `(box, (text, conf))` 和新版 `OCRResult` dict（`rec_texts`/`rec_scores` 键）
+  - **GPU 子进程专用 Python**: `_get_ocr_python()` 使用 PPOCRLabel venv 的 Python（paddlepaddle-gpu 3.2.2 兼容 paddleocr 3.6.0）
+  - **环境隔离**: `_get_ocr_env()` 清除 PYTHONPATH，防止 conda base 路径干扰 venv 包加载
+  - 单页/批量/直接模式全部集成 `_wait_for_gpu_slot()` 背压
+  - 大文件分批: 每批 ≤50 页，动态超时 `max(300, pages × 15s)`
+
+- **重构** `src/ingestion/file_processor.py` — PDF 双槽并行入库:
+  - `_process_pdf_progressive()` — 2 OCR 子进程 + 1 嵌入线程 同时跑:
+    - OCR: `ThreadPoolExecutor(max_workers=2)` 提交全部批次，`as_completed` 消费
+    - 嵌入: 独立 `threading.Thread` 从 `queue.Queue` 取 chunk 编码入库
+    - 任意 OCR 完成 → 立即分块 → 入队，嵌入线程并行消费
+    - 中断恢复: `delete_by_file_hash(file_hash)` 清理已插入 chunk
+  - `_embed_and_insert()` — 嵌入+入库抽成独立方法
+  - `process()` 路由: PDF+OCR → 渐进式，其他 → 通用路径
+  - **docx 解析增强**: 遍历 `doc.tables` 提取表格文本，格式化为 `[表格N]\n列A | 列B`
+    - 电力规范 docx 表格信息占比 20-80%，不再丢失
+    - 异常日志: ImportError → "请安装 python-docx"，其他异常 → 打印文件名和错误
+
+- **修改** `src/retrieval/reranker.py`:
+  - 新增 `unload()` — `del self.model` + `torch.cuda.empty_cache()`，释放 ~2GB 显存
+  - `_ensure_loaded()` 保持不变，下次 rerank 时自动重新加载（~5s）
+
+- **修改** `src/retrieval/retriever.py`:
+  - `search()` 完成后自动调用 `self.reranker.unload()`，reranker 用后即卸
+  - 交叉编码器未使用时无需常驻显存
+
+- **修改** `src/api/main.py`:
+  - 移除启动时 OCR 模型预热 — PaddleOCR 4个子模型（检测/识别/方向/文档预处理）~3-4GB，与 BGE-M3(~2GB)+BGE-Reranker(~2GB) 同时加载撑爆 12GB
+  - 新增 `GET /gpu` — GPU 显存状态端点
+  - `POST /files/sync` — 一致性校验端点（扫描失效文件、清理孤记录）
+  - `DELETE /files/{id}?remove_file=true` — 删除时可选清理 uploads 下的物理文件
+
+- **修改** `src/ui/app.py`:
+  - 新增「扫描失效文件」按钮: dry-run 扫描注册表中物理文件不存在的记录
+  - 新增「清理失效文件」按钮: 执行 vector+registry 清理
+  - 文件列表刷新时自动检测物理文件存在性，失效文件显示 `[~] 文件丢失`
+  - 标题栏显示失效文件总数警告
+
+- **修改** `config.yaml`:
+  - `ocr.use_gpu: true` — 启用 GPU 推理 (~5-7s/页 vs CPU ~15-18s/页)
+  - `ocr.page_delay_ms: 0` — GPU 模式无需冷却延迟
+  - 新增 `ocr.gpu_memory` 配置: `min_free_vram_mb/poll_interval_s/max_wait_s`
+
+- **效果对比**:
+  | 指标 | 修改前 | 修改后 |
+  |------|--------|--------|
+  | 启动显存 | 11.9 GB (全预加载) | 1.7 GB (仅系统) |
+  | 常态显存 | 11.9 GB | 3.8 GB (BGE-M3) |
+  | 搜索峰值 | 11.9 GB | 5.8 GB (临时加载 Reranker) |
+  | 入库 OCR 峰值 | 11.9 GB | 8 GB (2×PaddleOCR + BGE-M3) |
+  | 空闲显存 | 0 | 8.4 GB (LLM 随便用) |
+  | 138页全扫描 | 超时失败 | ~13 分钟 (双槽并行) |
+  | CJJ61-2017 OCR | 子进程崩溃 RC=1 | 5.7s/页, 正常识别 |
+
+### 文件注册表-向量库-物理文件三端一致性
+
+- **修改** `src/ingestion/file_processor.py`:
+  - `list_files()` 新增 `check_existence=True`，自动检测物理文件是否存在，返回 `file_exists` 字段
+  - `delete()` 新增 `remove_file` 参数，仅删除 uploads/ 下文件（安全策略）
+  - `sync_orphans()` 新增 — 扫描注册表中物理文件已消失的孤记录
+
+### 检索质量评估体系设计
+
+- **更新** `docs/送电输电标准规范检索测试报告.md` — 三层评估框架:
+  - 检索质量: Recall@K, MRR, NDCG@10, Precision@K
+  - 召回质量: 文档召回率, Chunk召回率, 跨文档覆盖率, 域/类目准确性
+  - 重排效果: Top-1 提升率, MRR提升, NDCG提升, 退化检测
+- 测试数据集规范: 每条题目必须带 `domain` + `category` + `relevant_chunks`
+
+---
+
 ## 2026-06-09
 
 ### PaddleOCR 扫描件 PDF 识别

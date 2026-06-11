@@ -33,8 +33,10 @@ FastAPI (:8000)
 | 三阶段检索 (分析→召回→精排) | 兼顾召回率和准确率 |
 | 文件注册表识别 + 完整文档注入 | query 含文件名时注入完整文档，解决 chunk 检索遗漏问题 |
 | 同系列文件排除 | 匹配会议材料之一时排除 02-07，防止 LLM 混淆 |
-| PaddleOCR 扫描件识别 | 子进程隔离，自动检测文字量不足的页面并 OCR |
-| 延迟加载 + 启动预热 | 减少冷启动内存，启动时预加载嵌入+OCR模型 |
+| PaddleOCR 扫描件识别 | 子进程隔离，自动检测文字量不足的页面并 OCR (GPU/CPU 可选) |
+| GPU 显存感知调度 | 入库/搜索时按需加载模型，用完即卸，LLM 优先 |
+| OCR 双槽并行 + 嵌入流水线 | 2个OCR子进程 + 1个嵌入线程同时跑，时间减半 |
+| 三端一致性机制 | 注册表-向量库-物理文件 同步清理，失效文件自动检测 |
 
 ## 2. 模块详解
 
@@ -183,12 +185,17 @@ count = registry.get_file_count()  # → 32
 
 **类**: `Reranker`
 
-两种模式:
+支持两种后端：
 
-| 模式 | 算法 | 配置 |
+| 后端 | 算法 | 配置 |
 |------|------|------|
 | FlagEmbedding | BGE-Reranker-v2-m3 交叉编码器 | `provider: "flagembedding"` |
 | Ollama | 用 BGE-M3 嵌入 query + 候选文本 → 余弦相似度 | `provider: "ollama"` |
+
+**按需加载/卸载**:
+- `_ensure_loaded()`: 首次 rerank 时加载模型（~5s）
+- `unload()`: 搜索完成后释放 — `del self.model` + `torch.cuda.empty_cache()`，释放 ~2GB 显存
+- Retriever 在每次 `search()` 完成后自动调用 `unload()`，下次搜索按需重载
 
 **元数据加权** (两种模式通用):
 - 文件名匹配: ×1.30
@@ -201,71 +208,158 @@ count = registry.get_file_count()  # → 32
 
 **置信度校准**: 每个结果附带 `confidence` (0-1)，基于 rerank 分数 min-max 归一化。
 
-### 2.7 OCR 引擎 (`ingestion/ocr_engine.py`)
+### 2.7 GPU 显存监控 (`utils/gpu_monitor.py`)
+
+**`新增`** **类**: `GpuMonitor` — GPU 显存实时监控 + 背压调度
+
+**功能**:
+- `get_vram_info()`: pynvml 实时查询 总/已用/空闲显存
+- `is_ollama_busy()`: 通过 `/api/ps` 检测 Ollama 是否有模型在推理
+- `wait_for_vram(min_free_mb)`: 背压等待 — 显存不足时检查 Ollama 状态，LLM 繁忙则轮询等待直至释放，LLM 空闲则短等 30s 后强制执行
+
+**显存预算 (RTX 4070 SUPER 12GB)**:
+```
+BGE-M3 (常驻)        ~2.0 GB    每次查询都要做 embedding
+BGE-Reranker (按需)   ~2.0 GB    搜索时加载，用完释放
+PaddleOCR (按需)      ~2.5 GB    入库时加载，子进程退出释放
+Ollama LLM (独立)     ~4.0 GB    独立进程，不占 Python 显存
+系统 + 桌面           ~1.5 GB    Windows + VS Code + Edge
+────────────────────────────────
+峰值并行               ~8.0 GB    12GB 容量内有 33% 裕量
+常态                   ~3.8 GB    仅 BGE-M3 + 系统
+```
+
+**调度策略**:
+| 场景 | BGE-M3 | Reranker | PaddleOCR | 显存 |
+|------|:---:|:---:|:---:|------|
+| 空闲 | ✅ 常驻 | — | — | 3.8 GB |
+| 用户提问 | ✅ | ✅ 临时加载 | — | 5.8 GB → 用完释放 |
+| 入库纯文字 | ✅ | — | — | 3.8 GB |
+| 入库含扫描页 | ✅ | — | ✅ 2进程 | 8 GB → 子进程退出释放 |
+| 提问+入库同时 | ✅ | ✅ | ✅ 1进程 | 7-8 GB ✓ |
+
+### 2.8 OCR 引擎 (`ingestion/ocr_engine.py`)
 
 **类**: `OCREngine` — PaddleOCR 子进程隔离封装
 
-通过子进程运行 PaddleOCR，解决 paddlepaddle (需 protobuf ≤3.20) 与 pymilvus (需 protobuf ≥5.27) 的版本冲突。
+通过子进程运行 PaddleOCR，解决 paddlepaddle GPU 版与环境冲突。OCR 子进程使用 PPOCRLabel venv 的 Python 解释器（paddlepaddle-gpu 3.2.2 + paddleocr 3.6.0 兼容配对）。
 
 **架构**:
 ```
-主进程 (protobuf 5.x + pymilvus)
+主进程 (conda base, protobuf 5.x + pymilvus)
     │
+    │  _get_ocr_python() → PPOCRLabel .venv python
+    │  _get_ocr_env()    → PYTHONPATH="" + PROTOCOL_BUFFERS=python
     │  subprocess.run()
     ▼
-OCR 子进程 (PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python)
+OCR 子进程
+    │  sys.stdout → stderr (模型加载日志)
+    │  _orig_stdout_fd → 干净 JSON 通道
     │
     ├─ import torch (先加载，固定 DLL)
-    ├─ import paddle
-    └─ paddleocr.PaddleOCR (lang="ch", PP-OCRv4)
+    ├─ import paddle → paddleocr.PaddleOCR
+    └─ PaddleOCR(lang="ch", use_textline_orientation=True, device="gpu")
+```
+
+**stdout/stderr 分离机制**:
+- CLI 入口 `__main__` 将 `sys.stdout` 重定向到 `sys.stderr`
+- 保存 `_orig_stdout_fd = os.fdopen(os.dup(1))` 作为原始 stdout
+- PaddleOCR 初始化日志（ANSI 彩色输出、模型加载信息）→ stderr
+- `_stdout_json()` 通过 `_orig_stdout_fd` 输出 JSON → 主进程 `capture_output` 拿到干净数据
+- `_parse_json_stdout()` 兼容处理: 从多行混合输出中提取 JSON（从后往前找 `{` 行）
+
+**PaddleOCR 2.x/3.x 兼容**:
+```python
+# 3.x: OCRResult dict
+if isinstance(r0, dict) and "rec_texts" in r0:
+    texts = r0["rec_texts"]
+    scores = r0["rec_scores"]
+
+# 2.x: [[box, (text, conf)], ...]
+elif isinstance(r0, list):
+    for box, (text, confidence) in r0:
+        ...
 ```
 
 **批量子进程模式** (`--batch`):
 - 主进程将图片路径列表通过 stdin JSON 传给子进程
 - 子进程一次性加载模型，批量处理所有图片
-- 4 页仅需 1 次子进程启动（vs 逐页 4 次）
-- 性能: 首次 ~10s (模型加载) + ~1.5s/页
+- DPI 150: GPU ~5-7s/页 (PP-OCRv5_server)
+
+**大文件分批 + 动态超时**:
+- 每批 ≤50 页，避免单次子进程超时和显存溢出
+- 超时 = `max(300, chunk_pages × 15s)`，按页数自动伸缩
 
 **API**:
 ```python
-engine = OCREngine(use_subprocess=True)
+engine = OCREngine(lang='ch', dpi=150, use_subprocess=True, use_gpu=True)
 
 # 单图 OCR
 result = engine.ocr_page("/path/to/page.png")
-# → {"success": True, "text": "识别文本", "lines": [...], "elapsed_ms": 1234}
 
-# PDF 批量 OCR
-result = engine.ocr_pdf_pages("/path/to/doc.pdf", [0, 1, 4])
-# → {"success": True, "text": "合并文本", "pages": {1: {...}, 2: {...}}, ...}
+# PDF 批量 OCR (内部自动分批)
+result = engine.ocr_pdf_pages("/path/to/doc.pdf", pages=[0..137])
 ```
 
-### 2.8 文件处理器 (`ingestion/file_processor.py`)
+### 2.9 文件处理器 (`ingestion/file_processor.py`)
 
-**类**: `FileProcessor` — 完整入库管道
+**类**: `FileProcessor` — 完整入库管道 + 双槽并行调度
 
 ```
 process(file_path, domain, category)
     │
-    ├─ Step 1: 解析 (parse_time_ms)
-    │   _build_file_meta() → _parse_file()
-    │   ├─ PDF: PDFParser → Chunker
-    │   ├─ DOC: Word COM (win32com) → LibreOffice → olefile → antiword
-    │   ├─ DOCX: python-docx → Chunker
-    │   ├─ XLSX: openpyxl → Chunker
-    │   └─ TXT/MD: 直接读取 → Chunker
+    ├─ compute_hash() → 查注册表 → 已入库则跳过
     │
-    ├─ Step 2: 嵌入 (embed_time_ms)
-    │   Embedder.encode(embedding_texts)
+    ├─ [PDF + OCR 启用] _process_pdf_progressive()
+    │   │
+    │   ├─ PDFParser.parse() → 检测 needs_ocr_pages
+    │   ├─ ThreadPoolExecutor(2) → 2个OCR子进程并行
+    │   │   Worker1: ocr_pages(batch1) ─┐
+    │   │   Worker2: ocr_pages(batch2) ─┤ 同时跑!
+    │   │                                │
+    │   ├─ queue.Queue ← 分块完成入队 ←┘
+    │   └─ Thread: 嵌入+insert (与OCR并行消费队列)
     │
-    └─ Step 3: 入库
-        MilvusStore.insert(chunks, dense_vecs, sparse_vecs, emb_texts)
+    └─ [通用路径] _parse_file() → _embed_and_insert()
+        │
+        ├─ Step 1: 解析
+        │   ├─ PDF: PDFParser → Chunker
+        │   ├─ DOC: Word COM (win32com) → LibreOffice → olefile → antiword
+        │   ├─ DOCX: python-docx (段落+表格) → Chunker
+        │   ├─ WPS: 6级回退: docx→zip→LibreOffice→olefile→WPS COM→Word COM
+        │   ├─ XLSX: openpyxl → Chunker
+        │   └─ TXT/MD: 直接读取 → Chunker
+        │
+        ├─ Step 2: 嵌入
+        │   Embedder.encode(embedding_texts) — GPU CUDA
+        │
+        └─ Step 3: 入库
+            MilvusStore.insert(chunks, dense_vecs, sparse_vecs)
 ```
 
-**去重**: 基于 SHA-256 文件哈希，`file_metadata.db` 中记录状态，已入库文件自动跳过。
+**双槽并行效果**:
+```
+138页全扫描 (10批, 每批15页):
+  串行: 10×75s + 嵌入56s = 806s
+  双槽: 5×75s + 嵌入56s(与OCR并行) ≈ 430s  快 47%
+```
 
-**.doc 解析**: 通过 `win32com.client.Dispatch("Word.Application")` 自动化本机 Word（Windows），大幅提升旧版 .doc 文件解析成功率。
+**docx 表格提取**:
+```python
+for table in doc.tables:
+    for row in table.rows:
+        cells = [p.text for p in cell.paragraphs if p.text.strip()]
+        rows_text.append(" | ".join(cells))
+    # → "[表格1]\n列A | 列B | 列C"
+```
 
-### 2.9 LLM 推理引擎 (`generation/llm_engine.py`)
+**三端一致性**:
+- `list_files(check_existence=True)`: 返回 `file_exists` 字段
+- `delete(remove_file=True)`: 同步清理 uploads 下物理文件
+- `sync_orphans()`: 扫描物理文件已消失的记录 → 清理向量+标记 deleted
+- 异常中断恢复: `delete_by_file_hash(file_hash)` 清理已插入 chunk
+
+### 2.10 LLM 推理引擎 (`generation/llm_engine.py`)
 
 **类**: `LLMEngine` — Provider 模式 facade
 
@@ -292,7 +386,7 @@ LLMEngine (facade)
 - `general_qa`: 通用问答
 - `SYSTEM_PROMPT_CHAT`: 多轮对话系统提示 (直接回答，不输出思考过程)
 
-### 2.10 对话管理 (`generation/conversation_manager.py`)
+### 2.11 对话管理 (`generation/conversation_manager.py`)
 
 **类**: `ConversationManager`
 
@@ -301,7 +395,7 @@ LLMEngine (facade)
 - 保留最近 `keep_detail_rounds=3` 轮完整内容
 - 所有时间戳使用北京时间 `Asia/Shanghai`
 
-### 2.11 Gradio UI (`ui/app.py`)
+### 2.12 Gradio UI (`ui/app.py`)
 
 **v3.0 重构** — 聊天界面 + 会话管理:
 
@@ -438,6 +532,36 @@ data: {"token":"","done":true,"citations":[...],"full_answer":"..."}  // 完成
 
 获取会话历史(含完整消息列表) 或 删除会话。
 
+### GET /gpu
+
+GPU 显存状态（`新增`）:
+
+```json
+{
+  "total_mb": 12282,
+  "used_mb": 3833,
+  "free_mb": 8448,
+  "usage_pct": 31.2,
+  "ollama_busy": false
+}
+```
+
+### POST /files/sync
+
+一致性校验（`新增`）:
+
+```
+POST /files/sync?dry_run=false  → 执行清理
+POST /files/sync?dry_run=true   → 仅扫描
+```
+
+### DELETE /files/{identifier}
+
+```
+DELETE /files/{identifier}?remove_file=true   → 同时清理物理文件
+DELETE /files/{identifier}?remove_file=false  → 仅删向量+注册表
+```
+
 ## 4. 数据流
 
 ### 4.1 入库流程
@@ -546,16 +670,36 @@ Retriever.search(query, top_k)
 
 ### 5.1 配置文件
 
-`config.yaml` 位于项目根目录，所有路径相对解析。
+`config.yaml` 位于项目根目录，所有路径相对解析。关键配置节：
+
+```yaml
+ocr:
+  use_gpu: true              # GPU 推理 (~5s/页 vs CPU ~15s/页)
+  dpi: 150
+  gpu_memory:
+    min_free_vram_mb: 2500   # 入库所需最小空闲显存
+    poll_interval_s: 5       # 显存轮询间隔
+    max_wait_s: 600          # 最大等待时间
+
+embedding:
+  provider: "sentence_transformers"
+  model_name: "BAAI/bge-m3"
+  device: "cuda"
+
+reranker:
+  provider: "flagembedding"
+  model_name: "BAAI/bge-reranker-v2-m3"
+  device: "cuda"
+```
 
 ### 5.2 模型运行位置
 
-| 模型 | 运行位置 | 说明 |
-|------|----------|------|
-| BAAI/bge-m3 | GPU (sentence_transformers) | 稠密+稀疏嵌入 |
-| BAAI/bge-reranker-v2-m3 | GPU (FlagEmbedding) | 交叉编码器精排 |
-| qwen3.5:4b | GPU (Ollama) | LLM 问答，think=false 关闭思考链 |
-| bge-m3:latest | GPU (Ollama) | Ollama 备用嵌入 |
+| 模型 | 运行位置 | 加载策略 | 显存 |
+|------|----------|----------|------|
+| BAAI/bge-m3 | GPU (sentence_transformers) | 常驻 | ~2.0 GB |
+| BAAI/bge-reranker-v2-m3 | GPU (FlagEmbedding) | 按需加载/卸载 | ~2.0 GB |
+| PaddleOCR PP-OCRv5_server | GPU (PPOCRLabel venv) | 入库时子进程加载，退出释放 | ~2.5 GB |
+| qwen3.5:4b | GPU (Ollama) | 独立进程 | ~4.0 GB |
 
 ### 5.3 数据存储
 
@@ -574,12 +718,13 @@ Retriever.search(query, top_k)
 | 参数 | 值 |
 |------|-----|
 | 嵌入维度 | 1024 (BGE-M3 稠密) + 原生稀疏 |
-| 单次嵌入耗时 | ~7s / 16 chunks (GPU) |
-| 检索耗时 | ~3s (QueryAnalyze+HybridSearch+Rerank) |
-| LLM token/s | **~112 t/s** (qwen3:4b, 32k ctx, Ollama eval_rate) |
-| 问答总耗时 | ~8-15s (搜索3s + LLM生成5-12s, think=false时) |
+| 单 chunk 嵌入 | ~200ms (GPU CUDA, batch=32) |
+| 检索耗时 | ~3-4s (QueryAnalyze+HybridSearch+Reranker加载+Rerank) |
+| LLM token/s | ~112 t/s (qwen3.5:4b, think=false) |
+| 问答总耗时 | ~8-15s (搜索4s + LLM生成5-12s) |
+| OCR 扫描页 | ~5-7s/页 (GPU, PP-OCRv5_server) |
+| 138页全扫描件 | ~7-8 分钟 (双槽并行) |
 | 粗召回候选数 | 50 |
 | 精排结果数 | 15 (可配置) |
 | GPU | NVIDIA RTX 4070 SUPER (12GB) |
-
-> **注**: Qwen3 推理模型强制 thinking，112 t/s 中仅 1-15% 为有效内容（剩余被内部思维链消耗）。Qwen3.5 通过 `think=false` 彻底关闭思维链后，112 t/s 全部为有效输出。
+| 空闲显存 | ~8.4 GB (常态仅 BGE-M3 + 系统) |
