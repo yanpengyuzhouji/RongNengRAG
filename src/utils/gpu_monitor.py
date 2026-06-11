@@ -77,16 +77,39 @@ class GpuMonitor:
         获取 GPU 显存信息
 
         Returns:
-            {total_mb, used_mb, free_mb, device_index}
+            {total_mb, used_mb, free_mb, effective_free_mb, device_index}
+            effective_free_mb = nvidia-smi free + WDDM 可回收缓存
         """
         if self._nvml_available:
             try:
                 handle = self._nvml.nvmlDeviceGetHandleByIndex(0)
                 info = self._nvml.nvmlDeviceGetMemoryInfo(handle)
+                total_mb = info.total // (1024 * 1024)
+                used_mb = info.used // (1024 * 1024)
+                free_mb = info.free // (1024 * 1024)
+
+                # WDDM 驱动缓存: nvidia-smi used 中不归 torch 管的部分可被复用
+                torch_reserved = 0
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch_reserved = torch.cuda.memory_reserved(0) // (1024 * 1024)
+                except Exception:
+                    pass
+
+                # 系统桌面渲染预留 ~1700MB
+                system_overhead = 1700
+                # WDDM 缓存 = nvml.used - torch_reserved - 系统开销
+                wddm_cache = max(0, used_mb - torch_reserved - system_overhead)
+                effective_free_mb = free_mb + wddm_cache
+
                 return {
-                    "total_mb": info.total // (1024 * 1024),
-                    "used_mb": info.used // (1024 * 1024),
-                    "free_mb": info.free // (1024 * 1024),
+                    "total_mb": total_mb,
+                    "used_mb": used_mb,
+                    "free_mb": free_mb,
+                    "effective_free_mb": effective_free_mb,
+                    "torch_reserved_mb": torch_reserved,
+                    "wddm_cached_mb": wddm_cache,
                     "device_index": 0,
                 }
             except Exception:
@@ -166,7 +189,8 @@ class GpuMonitor:
 
         while True:
             vram = self.get_vram_info()
-            free_mb = vram["free_mb"]
+            # 用有效空闲（含 WDDM 可回收缓存），而非 nvidia-smi 报告值
+            free_mb = vram.get("effective_free_mb", vram["free_mb"])
             elapsed = time.time() - t_start
 
             if free_mb >= min_free_mb:

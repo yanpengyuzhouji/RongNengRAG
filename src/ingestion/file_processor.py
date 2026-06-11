@@ -584,10 +584,11 @@ class FileProcessor:
         时间: 138页全扫描 2×15页/批×~75s → ~5批/worker×~75s = ~375s (vs 串行750s)
         """
         import concurrent.futures
-        import threading
-        import queue
         OCR_BATCH = 15  # 每批 OCR 页数
         OCR_WORKERS = 2  # 并行 OCR 子进程数
+
+        # GPU 预算说明: 2×PaddleOCR(~2.5GB each) = 5GB, BGE-M3 等OCR完成后再加载
+        # 背压策略: OCR 期间不加载 BGE-M3，全部OCR完成后再嵌入，避免三端争抢GPU
 
         parsed = self.pdf_parser.parse(file_path)
         needs_ocr = parsed.get("needs_ocr_pages", [])
@@ -617,41 +618,10 @@ class FileProcessor:
         ]
         total_batches = len(batches)
 
-        # 嵌入队列：OCR线程放入 (batch_idx, chunks)，嵌入线程消费
-        embed_queue = queue.Queue(maxsize=total_batches + 1)
-        embed_total_ms = [0.0]  # 用list做可变引用
-        embed_done = threading.Event()
-        all_inserted = threading.Event()
-
-        def _ensure_embedder():
-            if self.embedder is None:
-                self._wait_for_gpu_slot("BGE-M3 嵌入模型加载")
-                self.embedder = Embedder(self.config_path)
-
-        def _embed_worker():
-            """嵌入线程：从队列取chunks，编码+写入Milvus"""
-            _ensure_embedder()
-            batch_order = []  # 记录嵌入顺序以便日志
-            while True:
-                item = embed_queue.get()
-                if item is None:  # 毒丸信号
-                    break
-                bc = item
-                batch_order.append(len(bc))
-                t0 = time.time()
-                texts = [create_text_for_embedding(c) for c in bc]
-                emb = self.embedder.encode(texts, show_progress=False)
-                self.store.insert(
-                    chunks=bc, dense_vectors=emb.dense_vectors,
-                    sparse_vectors=emb.sparse_vectors,
-                    embedding_texts=texts, batch_size=min(500, len(bc)),
-                )
-                embed_total_ms[0] += (time.time() - t0) * 1000
-                embed_queue.task_done()
-            embed_done.set()
+        # 收集已分块的chunks（OCR完成后统一嵌入，避免与OCR争抢GPU显存）
+        chunk_batches = []
 
         def _run_ocr_safe(pages_0based):
-            """OCR子进程包装，异常转返回空dict"""
             try:
                 return self.pdf_parser.ocr_pages(file_path, pages_0based)
             except Exception as e:
@@ -661,38 +631,28 @@ class FileProcessor:
         # 清理旧索引
         self.store.delete_by_file_hash(file_hash)
 
-        # 启动嵌入线程
-        embed_thread = threading.Thread(target=_embed_worker, daemon=True)
-        embed_thread.start()
-
         try:
             # 提交所有OCR批次到2-worker池
             ocr_completed = 0
             with concurrent.futures.ThreadPoolExecutor(max_workers=OCR_WORKERS) as pool:
-                futures = {}
-                for bi, bp in enumerate(batches):
-                    f = pool.submit(_run_ocr_safe, bp)
-                    futures[f] = bi
+                futures = {pool.submit(_run_ocr_safe, bp): bi
+                           for bi, bp in enumerate(batches)}
 
-                completed = {}
                 for future in concurrent.futures.as_completed(futures):
                     bi = futures[future]
                     ocr_texts = future.result()
                     ocr_completed += 1
 
-                    # 分块
                     batch_text = "\n\n".join(ocr_texts.values())
                     if batch_text.strip():
                         bc = self.chunker.chunk_text_document(batch_text, file_meta)
                         all_chunks.extend(bc)
                         total_chars += sum(c.char_count for c in bc)
-                        completed[bi] = bc
-                        # 放入嵌入队列（嵌入线程并行消费）
-                        embed_queue.put(bc)
+                        chunk_batches.append(bc)
 
-                    print(f"   [OCR] {ocr_completed}/{total_batches} 完成 "
+                    print(f"   [OCR] {ocr_completed}/{total_batches} "
                           f"(批次{bi + 1}: {len(ocr_texts)}页 → "
-                          f"{len(completed.get(bi, []))}chunks, "
+                          f"{len(chunk_batches[-1]) if chunk_batches else 0}chunks, "
                           f"{(time.time() - t_start):.0f}s)")
 
                     if progress_callback:
@@ -701,19 +661,43 @@ class FileProcessor:
                             ocr_completed / (total_batches + 1)
                         )
 
-            # 所有OCR完成，通知嵌入线程退出
-            embed_queue.put(None)
-            embed_thread.join(timeout=120)
+            # ===== 所有OCR完成 → 一次性嵌入 + 入库 =====
+            # 此时OCR子进程已全部退出，BGE-M3独享GPU，不会爆显存
+            embed_total_ms = 0.0
+            if chunk_batches:
+                # 合并所有chunks为一批嵌入（BGE-M3 batch=32 高效）
+                all_embed_chunks = []
+                for bc in chunk_batches:
+                    all_embed_chunks.extend(bc)
+                all_chunks = all_embed_chunks  # 直接用合并后的列表
+
+                if progress_callback:
+                    progress_callback(
+                        f"嵌入向量 ({len(all_chunks)} chunks)", 0.95
+                    )
+
+                if self.embedder is None:
+                    self._wait_for_gpu_slot("BGE-M3 嵌入模型加载")
+                    self.embedder = Embedder(self.config_path)
+
+                t_embed = time.time()
+                embedding_texts = [create_text_for_embedding(c)
+                                   for c in all_chunks]
+                emb_result = self.embedder.encode(embedding_texts,
+                                                   show_progress=False)
+                embed_total_ms = (time.time() - t_embed) * 1000
+
+                self.store.insert(
+                    chunks=all_chunks,
+                    dense_vectors=emb_result.dense_vectors,
+                    sparse_vectors=emb_result.sparse_vectors,
+                    embedding_texts=embedding_texts,
+                    batch_size=min(500, len(all_chunks)),
+                )
 
         except Exception as e:
-            # 中断时清理已插入的chunks
             print(f"   [ERR] 入库中断: {e}")
-            try:
-                embed_queue.put(None)  # 停止嵌入线程
-                embed_thread.join(timeout=10)
-                self.store.delete_by_file_hash(file_hash)
-            except Exception:
-                pass
+            self.store.delete_by_file_hash(file_hash)
             raise
 
         # 标记完成
@@ -731,7 +715,7 @@ class FileProcessor:
         result.category = file_meta.get("category", "")
         result.doc_number = file_meta.get("doc_number", "")
         result.parse_time_ms = (time.time() - t_start) * 1000
-        result.embed_time_ms = embed_total_ms[0]
+        result.embed_time_ms = embed_total_ms
         result.status = FileStatus.COMPLETED
         result.total_time_ms = (time.time() - t_start) * 1000
 

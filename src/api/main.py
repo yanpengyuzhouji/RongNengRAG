@@ -539,14 +539,24 @@ async def get_stats():
 
 @app.get("/gpu")
 async def get_gpu_status():
-    """GPU 显存状态"""
+    """GPU 显存状态 (含 WDDM 缓存说明)"""
     try:
         from utils.gpu_monitor import get_gpu_monitor
+        import torch
         m = get_gpu_monitor()
         vram = m.get_vram_info()
+        # torch 实际占用 vs nvidia-smi 报告值
+        torch_reserved = 0
+        if torch.cuda.is_available():
+            torch_reserved = torch.cuda.memory_reserved(0) // (1024 * 1024)
+        # nvidia-smi used 减去 torch reserved 就是 WDDM 驱动缓存 + 其他进程
+        wddm_cached = max(0, vram["used_mb"] - torch_reserved - 1700)  # ~1700MB 系统桌面
         return {
             **vram,
             "usage_pct": round(vram["used_mb"] / vram["total_mb"] * 100, 1) if vram["total_mb"] else 0,
+            "torch_reserved_mb": torch_reserved,
+            "wddm_cached_mb": wddm_cached,
+            "note": "WDDM驱动缓存不计入实际占用，新CUDA分配时自动复用" if wddm_cached > 500 else "",
             "ollama_busy": m.is_ollama_busy(),
         }
     except ImportError:
