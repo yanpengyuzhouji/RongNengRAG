@@ -601,18 +601,9 @@ class FileProcessor:
         # 清理旧索引
         self.store.delete_by_file_hash(file_hash)
 
-        # ===== OCR前: 卸载BGE-M3 =====
-        embedder_was_loaded = self.embedder is not None
-        if embedder_was_loaded:
-            print("   [GPU] 卸载BGE-M3，释放显存给OCR")
-            try:
-                del self.embedder
-                self.embedder = None
-                import torch
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            except Exception as e:
-                print(f"   [GPU] BGE-M3卸载异常: {e}")
+        # BGE-M3 保持加载 (WDDM下del+empty_cache无法释放, 强行卸载反而浪费CPU)
+        # OCR子进程用PPOCRLabel venv独立CUDA context, ~500MB, 不冲突
+        # VRAM: BGE-M3(~2.4GB) + OCR(~0.5GB) = ~3GB 安全
 
         try:
             # ===== 一次性OCR全部页 — 子进程内部自动分批，单个CUDA context =====
@@ -644,8 +635,8 @@ class FileProcessor:
 
             embed_total_ms = 0.0
             if all_chunks:
+                # BGE-M3 已在启动时预热, 无需重新加载
                 if self.embedder is None:
-                    self._wait_for_gpu_slot("BGE-M3 嵌入模型加载")
                     self.embedder = Embedder(self.config_path)
 
                 t_embed = time.time()

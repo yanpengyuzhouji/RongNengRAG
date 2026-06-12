@@ -693,17 +693,14 @@ class OCREngine:
         try:
             proc = subprocess.run(
                 cmd,
-                capture_output=True, encoding="utf-8", errors="replace", timeout=120,
-                env=env,
-                cwd=str(script.parent.parent.parent),  # 项目根目录
+                input=None, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,  # stderr 丢弃防死锁
+                timeout=120, env=env,
+                cwd=str(script.parent.parent.parent),
             )
 
             if proc.returncode != 0:
-                stderr = proc.stderr or ""
-                return {
-                    "success": False,
-                    "error": f"OCR 子进程退出码 {proc.returncode}: {stderr[:500]}"
-                }
+                return {"success": False, "error": f"OCR 子进程退出码 {proc.returncode}"}
 
             return _parse_json_stdout(proc.stdout) or {}
 
@@ -801,8 +798,8 @@ class OCREngine:
                 try:
                     proc = subprocess.run(
                         batch_cmd,
-                        input=img_list_json,
-                        capture_output=True, encoding="utf-8", errors="replace",
+                        input=img_list_json, text=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                         timeout=chunk_timeout,
                         env=env,
                         cwd=str(script.parent.parent.parent),
@@ -811,8 +808,7 @@ class OCREngine:
                     if proc.returncode == 0 and proc.stdout.strip():
                         batch_results = _parse_json_stdout(proc.stdout) or []
                     else:
-                        stderr = proc.stderr or ""
-                        print(f"   [OCR] 批量 OCR 失败，该批次回退逐页: {stderr[:200]}")
+                        print(f"   [OCR] 批量 OCR 失败 (RC={proc.returncode})，回退逐页")
                 except subprocess.TimeoutExpired:
                     print(f"   [OCR] 批次超时 ({chunk_timeout}s)，该批次回退逐页")
                 except json.JSONDecodeError as e:
@@ -836,7 +832,8 @@ class OCREngine:
                         try:
                             proc = subprocess.run(
                                 single_cmd_base + [img_path],
-                                capture_output=True, encoding="utf-8", errors="replace",
+                                text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 timeout=180, env=env,
                                 cwd=str(script.parent.parent.parent),
                             )
