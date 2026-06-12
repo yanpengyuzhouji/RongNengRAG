@@ -632,6 +632,20 @@ class FileProcessor:
         # 清理旧索引
         self.store.delete_by_file_hash(file_hash)
 
+        # ===== OCR前: 卸载BGE-M3，释放显存给OCR =====
+        # 不卸载的话 BGE-M3(~2GB) + OCR子进程(~3-5GB) + WDDM影子 = 爆显存
+        embedder_was_loaded = self.embedder is not None
+        if embedder_was_loaded:
+            print("   [GPU] 卸载BGE-M3，释放显存给OCR...")
+            try:
+                del self.embedder
+                self.embedder = None
+                import torch
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            except Exception as e:
+                print(f"   [GPU] BGE-M3卸载异常: {e}")
+
         try:
             # 提交所有OCR批次到2-worker池
             ocr_completed = 0
@@ -651,7 +665,7 @@ class FileProcessor:
                         total_chars += sum(c.char_count for c in bc)
                         chunk_batches.append(bc)
 
-                    # 每批OCR完成后提示GPU释放
+                    # 每批OCR后清理PyTorch缓存(减少WDDM累积)
                     try:
                         import torch
                         if torch.cuda.is_available():
