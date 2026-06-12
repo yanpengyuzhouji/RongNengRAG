@@ -760,9 +760,10 @@ class OCREngine:
         if self.use_gpu:
             single_cmd_base.append("--use-gpu")
 
-        # 大文件分批: 每批最多 50 页，避免单次子进程超时和显存溢出
-        BATCH_CHUNK_SIZE = 50
-        GPU_SEC_PER_PAGE = 15  # GPU 保守估计 15s/页 (含首次模型加载)
+        # 单次子进程处理全部页面 — 避免多次 subprocess.run 导致
+        # WDDM 累积多个 CUDA context 撑爆显存
+        BATCH_CHUNK_SIZE = 500  # 足够覆盖任何PDF(单次子进程)
+        GPU_SEC_PER_PAGE = 20   # 保守超时预算
 
         t0 = time.time()
         doc = fitz.open(pdf_path)

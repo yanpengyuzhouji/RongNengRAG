@@ -570,34 +570,20 @@ class FileProcessor:
                                   file_size, file_ext, result: ProcessResult,
                                   progress_callback=None) -> Optional[ProcessResult]:
         """
-        PDF 双槽并行入库 — 2个OCR子进程 + 1个嵌入线程 同时跑
+        PDF 单进程渐进入库 — 一个OCR子进程处理全部扫描页
 
-        GPU预算 (12GB):
-          2×PaddleOCR(~3GB each) + BGE-M3(~2GB) = ~8GB ✓
+        关键设计: 一次 ocr_pages() 调用传入所有页，子进程内部自动分批(50页/批)。
+        避免多次子进程启动导致的 CUDA context 累积 + WDDM 显存不释放。
 
-        调度策略:
-          - 全部OCR批次提交到2-worker线程池
-          - 嵌入线程独立消费完成队列
-          - OCR并行度: 2 (两个子进程同时跑不同页)
-          - 损坏恢复: 文件标记 processing, _parse失败时 delete_by_file_hash
-
-        时间: 138页全扫描 2×15页/批×~75s → ~5批/worker×~75s = ~375s (vs 串行750s)
+        GPU: PaddleOCR(~4GB) → OCR完成 → 卸载 → BGE-M3(~2GB) → 嵌入
+             峰值 ~4GB，12GB 内安全
         """
-        import concurrent.futures
-        OCR_BATCH = 15  # 每批 OCR 页数
-        OCR_WORKERS = 1  # 并行 OCR 子进程数 (1=安全, 2=峰值11GB差点爆显存)
-
-        # GPU 预算: PaddleOCR(~3GB), BGE-M3 OCR完成后加载(~2GB), 峰值 ~5GB
-        # 实测: 2 workers = 11.9GB/12GB 爆显存 + WDDM影子吃满RAM
-        #       1 worker  = ~5GB 安全, 时间翻倍但不会炸
-
         parsed = self.pdf_parser.parse(file_path)
         needs_ocr = parsed.get("needs_ocr_pages", [])
         if not needs_ocr:
             return None
 
         ocr_pages_0based = [p - 1 for p in needs_ocr]
-        total_ocr = len(ocr_pages_0based)
         t_start = time.time()
 
         # 收集非OCR页文本
@@ -612,31 +598,13 @@ class FileProcessor:
                 all_chunks.extend(nc)
                 total_chars += sum(c.char_count for c in nc)
 
-        # 预建所有 OCR 批次
-        batches = [
-            ocr_pages_0based[i:i + OCR_BATCH]
-            for i in range(0, total_ocr, OCR_BATCH)
-        ]
-        total_batches = len(batches)
-
-        # 收集已分块的chunks（OCR完成后统一嵌入，避免与OCR争抢GPU显存）
-        chunk_batches = []
-
-        def _run_ocr_safe(pages_0based):
-            try:
-                return self.pdf_parser.ocr_pages(file_path, pages_0based)
-            except Exception as e:
-                print(f"   [OCR] 子进程异常: {e}")
-                return {}
-
         # 清理旧索引
         self.store.delete_by_file_hash(file_hash)
 
-        # ===== OCR前: 卸载BGE-M3，释放显存给OCR =====
-        # 不卸载的话 BGE-M3(~2GB) + OCR子进程(~3-5GB) + WDDM影子 = 爆显存
+        # ===== OCR前: 卸载BGE-M3 =====
         embedder_was_loaded = self.embedder is not None
         if embedder_was_loaded:
-            print("   [GPU] 卸载BGE-M3，释放显存给OCR...")
+            print("   [GPU] 卸载BGE-M3，释放显存给OCR")
             try:
                 del self.embedder
                 self.embedder = None
@@ -647,57 +615,35 @@ class FileProcessor:
                 print(f"   [GPU] BGE-M3卸载异常: {e}")
 
         try:
-            # 提交所有OCR批次到2-worker池
-            ocr_completed = 0
-            with concurrent.futures.ThreadPoolExecutor(max_workers=OCR_WORKERS) as pool:
-                futures = {pool.submit(_run_ocr_safe, bp): bi
-                           for bi, bp in enumerate(batches)}
+            # ===== 一次性OCR全部页 — 子进程内部自动分批，单个CUDA context =====
+            if progress_callback:
+                progress_callback(
+                    f"OCR识别 ({len(ocr_pages_0based)}页, GPU单进程)", 0.1
+                )
 
-                for future in concurrent.futures.as_completed(futures):
-                    bi = futures[future]
-                    ocr_texts = future.result()
-                    ocr_completed += 1
+            print(f"   [OCR] 开始识别 {len(ocr_pages_0based)} 页 (单进程)...")
+            ocr_texts = self.pdf_parser.ocr_pages(file_path, ocr_pages_0based)
 
-                    batch_text = "\n\n".join(ocr_texts.values())
-                    if batch_text.strip():
-                        bc = self.chunker.chunk_text_document(batch_text, file_meta)
-                        all_chunks.extend(bc)
-                        total_chars += sum(c.char_count for c in bc)
-                        chunk_batches.append(bc)
+            if progress_callback:
+                progress_callback("OCR完成, 分块中...", 0.5)
 
-                    # 每批OCR后清理PyTorch缓存(减少WDDM累积)
-                    try:
-                        import torch
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    except: pass
+            # 分块OCR结果
+            if ocr_texts:
+                ocr_text = "\n\n".join(ocr_texts.values())
+                if ocr_text.strip():
+                    ocr_chunks = self.chunker.chunk_text_document(ocr_text, file_meta)
+                    all_chunks.extend(ocr_chunks)
+                    total_chars += sum(c.char_count for c in ocr_chunks)
 
-                    print(f"   [OCR] {ocr_completed}/{total_batches} "
-                          f"(批次{bi + 1}: {len(ocr_texts)}页 → "
-                          f"{len(chunk_batches[-1]) if chunk_batches else 0}chunks, "
-                          f"{(time.time() - t_start):.0f}s)")
+            print(f"   [OCR] 完成: {len(ocr_texts)}有效页 → "
+                  f"{len(all_chunks)} chunks ({(time.time() - t_start):.0f}s)")
 
-                    if progress_callback:
-                        progress_callback(
-                            f"OCR ({ocr_completed}/{total_batches})",
-                            ocr_completed / (total_batches + 1)
-                        )
+            # ===== OCR子进程已退出, 重新加载BGE-M3 → 嵌入 =====
+            if progress_callback:
+                progress_callback("嵌入向量", 0.7)
 
-            # ===== 所有OCR完成 → 一次性嵌入 + 入库 =====
-            # 此时OCR子进程已全部退出，BGE-M3独享GPU，不会爆显存
             embed_total_ms = 0.0
-            if chunk_batches:
-                # 合并所有chunks为一批嵌入（BGE-M3 batch=32 高效）
-                all_embed_chunks = []
-                for bc in chunk_batches:
-                    all_embed_chunks.extend(bc)
-                all_chunks = all_embed_chunks  # 直接用合并后的列表
-
-                if progress_callback:
-                    progress_callback(
-                        f"嵌入向量 ({len(all_chunks)} chunks)", 0.95
-                    )
-
+            if all_chunks:
                 if self.embedder is None:
                     self._wait_for_gpu_slot("BGE-M3 嵌入模型加载")
                     self.embedder = Embedder(self.config_path)
@@ -708,6 +654,9 @@ class FileProcessor:
                 emb_result = self.embedder.encode(embedding_texts,
                                                    show_progress=False)
                 embed_total_ms = (time.time() - t_embed) * 1000
+
+                if progress_callback:
+                    progress_callback("写入向量库", 0.9)
 
                 self.store.insert(
                     chunks=all_chunks,
