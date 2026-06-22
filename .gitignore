@@ -45,3 +45,22 @@ Thumbs.db
 
 # Milvus
 milvus_data/
+
+# Evaluation outputs and temp files
+eval/output/
+eval/tmp_render/
+
+# Debug & benchmark temp files
+_*.log
+_*.txt
+_*.json
+bench_*.txt
+context_debug*.txt
+
+# OCR models (large binary)
+pp-ocrv5/
+pp-ocrv5.rar
+
+# Submodules / vendored tools
+tools/PPOCRLabel/
+tools/test_*.py
