@@ -18,6 +18,8 @@ import os
 import json
 import re
 import time
+import faulthandler
+faulthandler.enable(file=sys.stderr, all_threads=True)
 import shutil
 from typing import Optional, List
 
@@ -55,6 +57,13 @@ async def startup():
     from config import ensure_data_dirs, load_config, get_project_root
     cfg = load_config()
     ensure_data_dirs(cfg)
+
+    # 强制将所有缓存写到 E 盘，避免 C 盘被占满
+    _hf = cfg.get("embedding", {}).get("hf_home", "E:/huggingface_cache")
+    os.environ["HF_HOME"] = _hf
+    os.environ.setdefault("TORCH_HOME", os.path.join(_hf, "torch"))
+    os.makedirs(_hf, exist_ok=True)
+
     print(f"[startup] 项目根目录: {get_project_root()}")
     print(f"[startup] 数据目录: {cfg['paths']['uploads_dir']}")
     print(f"[startup] 向量库路径: {cfg['paths']['milvus_db']}")
@@ -62,7 +71,8 @@ async def startup():
     # 预热嵌入模型和重排序模型(避免首次请求等待)
     # 注意: OCR 不在启动时预热 — PaddleOCR 3个子模型 ~3-4GB 显存，
     #   与 BGE-M3(~2GB) + BGE-Reranker(~2GB) 同时加载会撑爆 12GB 显存
-    import threading
+    # 注意: 不用 daemon 线程 — CUDA 在 daemon 线程中操作可能触发段错误 (torch 2.8+)
+    import concurrent.futures
     def warmup():
         print("[startup] 预热嵌入模型...")
         try:
@@ -71,7 +81,8 @@ async def startup():
             print("[startup] 嵌入+重排序模型预热完成")
         except Exception as ex:
             print(f"[startup] 模型预热跳过: {ex}")
-    threading.Thread(target=warmup, daemon=True).start()
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="warmup")
+    _executor.submit(warmup)
 
 # 全局实例 (延迟加载)
 _processor: FileProcessor = None
@@ -206,6 +217,7 @@ class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(default=15, ge=1, le=50)
     domain_filter: Optional[str] = None
+    return_coarse_results: bool = False
 
 
 class SearchResultItem(BaseModel):
@@ -231,6 +243,7 @@ class SearchAPIResponse(BaseModel):
     elapsed_ms: float
     filter_applied: Optional[str]
     results: List[SearchResultItem]
+    coarse_results: Optional[List[SearchResultItem]] = None
 
 
 class AskRequest(BaseModel):
@@ -479,6 +492,98 @@ async def sync_files(dry_run: bool = Query(default=False, description="仅扫描
     return result
 
 
+@app.post("/files/recover-pending")
+async def recover_pending_files():
+    """
+    SSE 流式端点: 崩溃后自动恢复所有 pending 状态的文件
+
+    事件类型:
+      start       — {event, total}
+      file_start  — {event, file_name, index, total}
+      file_done   — {event, file_name, chunks, chars, elapsed_ms}
+      file_error  — {event, file_name, error}
+      done        — {event, total, success, failed}
+    """
+    from fastapi.responses import StreamingResponse
+
+    def generate():
+        processor = get_processor()
+
+        # 先将残留的 processing 文件也重置为 pending (防御)
+        processor._recover_stuck_files()
+
+        pending_files = processor.list_files(status="pending", limit=1000)
+        if not pending_files:
+            yield f"data: {json.dumps({'event': 'done', 'total': 0, 'success': 0, 'failed': 0})}\n\n"
+            return
+
+        # 收集有效路径 (物理文件存在)
+        valid = []
+        for f in pending_files:
+            fp = f.get("original_path") or f.get("stored_path") or ""
+            if fp and os.path.exists(fp):
+                valid.append((fp, f.get("file_name", os.path.basename(fp))))
+            else:
+                print(f"[recover] 跳过 pending 文件 (物理路径不存在): {f.get('file_name','?')}")
+
+        if not valid:
+            msg = json.dumps({"event": "done", "total": 0, "success": 0, "failed": 0,
+                             "message": "待恢复文件的物理路径不存在"})
+            yield f"data: {msg}\n\n"
+            return
+
+        total = len(valid)
+        yield f"data: {json.dumps({'event': 'start', 'total': total})}\n\n"
+
+        ok = 0
+        fail = 0
+        for i, (fp, fname) in enumerate(valid):
+            yield f"data: {json.dumps({'event': 'file_start', 'file_name': fname, 'index': i, 'total': total})}\n\n"
+
+            try:
+                result = processor.process(fp)
+                elapsed = result.total_time_ms
+                if result.status.value == "completed":
+                    ok += 1
+                    done_data = json.dumps({
+                        "event": "file_done", "file_name": fname,
+                        "chunks": result.chunks_created, "chars": result.chars_extracted,
+                        "elapsed_ms": elapsed,
+                    })
+                    yield f"data: {done_data}\n\n"
+                else:
+                    fail += 1
+                    err_data = json.dumps({
+                        "event": "file_error", "file_name": fname,
+                        "error": result.error_message[:200],
+                    })
+                    yield f"data: {err_data}\n\n"
+            except Exception as e:
+                fail += 1
+                exc_data = json.dumps({
+                    "event": "file_error", "file_name": fname,
+                    "error": str(e)[:200],
+                })
+                yield f"data: {exc_data}\n\n"
+
+        final_data = json.dumps({
+            "event": "done", "total": total,
+            "success": ok, "failed": fail,
+        })
+        yield f"data: {final_data}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Content-Encoding": "identity",
+        },
+    )
+
+
 @app.post("/files/{identifier}/reindex", response_model=UploadResponse)
 async def reindex_file(identifier: str):
     """重建文件索引 (删除后重新解析+嵌入+入库)"""
@@ -566,7 +671,8 @@ async def get_gpu_status():
 @app.post("/search", response_model=SearchAPIResponse)
 async def search(req: SearchRequest):
     r = get_retriever()
-    resp = r.search(query=req.query, top_k=req.top_k, domain_filter=req.domain_filter)
+    resp = r.search(query=req.query, top_k=req.top_k, domain_filter=req.domain_filter,
+                    return_coarse_results=req.return_coarse_results)
     results = []
     for i, item in enumerate(resp.results):
         results.append(SearchResultItem(
@@ -578,10 +684,24 @@ async def search(req: SearchRequest):
             voltage_level=item.voltage_level, publish_level=item.publish_level,
             page_num=item.page_num,
         ))
+    coarse_results = None
+    if resp.coarse_results:
+        coarse_results = []
+        for i, item in enumerate(resp.coarse_results):
+            coarse_results.append(SearchResultItem(
+                rank=i + 1, chunk_id=item.chunk_id,
+                text=item.text[:500] + ("..." if len(item.text) > 500 else ""),
+                score=item.score, confidence=item.confidence,
+                domain=item.domain, category=item.category,
+                file_path=item.file_path, doc_number=item.doc_number,
+                voltage_level=item.voltage_level, publish_level=item.publish_level,
+                page_num=item.page_num,
+            ))
     return SearchAPIResponse(
         query=resp.query, query_type=resp.query_type, domain=resp.domain,
         total_candidates=resp.total_candidates, elapsed_ms=resp.elapsed_ms,
         filter_applied=resp.filter_applied, results=results,
+        coarse_results=coarse_results,
     )
 
 
@@ -849,4 +969,4 @@ async def delete_conversation(conv_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, timeout_keep_alive=600)

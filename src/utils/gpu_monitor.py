@@ -140,6 +140,48 @@ class GpuMonitor:
         return self.get_vram_info().get("effective_free_mb",
                                         self.get_vram_info()["free_mb"])
 
+    def get_ocr_workers_possible(self, vram_per_worker_mb: int = 3000,
+                                  safety_margin_mb: int = 1500) -> int:
+        """
+        基于当前有效空闲显存估算可并行的OCR子进程数。
+
+        Args:
+            vram_per_worker_mb: 单个OCR子进程预估VRAM占用 (默认3000MB)
+            safety_margin_mb: VRAM安全裕量，低于此值返回1 (默认1500MB)
+
+        Returns:
+            可安全并行的OCR worker数 (≥1)
+        """
+        vram = self.get_vram_info()
+        effective_free = vram.get("effective_free_mb", vram["free_mb"])
+        available = effective_free - safety_margin_mb
+        if available <= vram_per_worker_mb:
+            return 1
+        return max(1, min(3, available // vram_per_worker_mb))
+
+    def log_vram_snapshot(self, tag: str = ""):
+        """
+        记录显存快照 — OCR/嵌入前后用于排查显存泄漏。
+
+        用法:
+            monitor.log_vram_snapshot("OCR前")
+            # ... OCR ...
+            monitor.log_vram_snapshot("OCR后")
+        """
+        vram = self.get_vram_info()
+        ram = self.get_system_ram_info()
+        tag_str = f" [{tag}]" if tag else ""
+        print(
+            f"   [VRAM{tag_str}] "
+            f"GPU: {vram['used_mb']}MB used / {vram['total_mb']}MB total, "
+            f"free={vram['free_mb']}MB, "
+            f"eff_free={vram.get('effective_free_mb', 'N/A')}MB, "
+            f"workers_possible={self.get_ocr_workers_possible()}"
+        )
+        """返回当前空闲显存 (MB)"""
+        return self.get_vram_info().get("effective_free_mb",
+                                        self.get_vram_info()["free_mb"])
+
     def get_system_ram_info(self) -> dict:
         """获取系统内存信息"""
         try:
@@ -281,3 +323,22 @@ def get_gpu_monitor(min_free_vram_mb: int = 3000) -> GpuMonitor:
     if _monitor is None:
         _monitor = GpuMonitor(min_free_vram_mb=min_free_vram_mb)
     return _monitor
+
+
+def log_vram_snapshot(tag: str = ""):
+    """模块级便捷函数 — 记录显存快照"""
+    try:
+        monitor = get_gpu_monitor()
+        monitor.log_vram_snapshot(tag)
+    except Exception:
+        pass
+
+
+def get_ocr_workers_possible(vram_per_worker_mb: int = 3000,
+                              safety_margin_mb: int = 1500) -> int:
+    """模块级便捷函数 — 获取可并行的OCR worker数"""
+    try:
+        monitor = get_gpu_monitor()
+        return monitor.get_ocr_workers_possible(vram_per_worker_mb, safety_margin_mb)
+    except Exception:
+        return 1

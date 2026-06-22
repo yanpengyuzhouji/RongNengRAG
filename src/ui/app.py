@@ -240,7 +240,8 @@ def chat_stream(query: str, history: list, conv_id: str, domain_filter: str, top
 
 def upload_and_index(files, domain: str, category: str, progress=gr.Progress()):
     if not files:
-        return "[WARN] 请先选择文件"
+        yield "[WARN] 请先选择文件"
+        return
 
     total = len(files)
     results = []
@@ -263,7 +264,7 @@ def upload_and_index(files, domain: str, category: str, progress=gr.Progress()):
                     f"{API_BASE}/upload",
                     files={"file": (orig_name, fh)},
                     data=form_data,
-                    timeout=600,
+                    timeout=(30, 900),  # (connect, read): 30s连接, 15min读取
                 )
             if resp.status_code == 200:
                 r = resp.json()
@@ -280,7 +281,6 @@ def upload_and_index(files, domain: str, category: str, progress=gr.Progress()):
                     results.append(f"| | {msg[:100]} | | | |")
             else:
                 results.append(f"| ❌ | {orig_name[:45]} | - | - | HTTP {resp.status_code} |")
-                # Try to read error detail
                 try:
                     err_detail = resp.json()
                     if isinstance(err_detail, dict) and 'detail' in err_detail:
@@ -292,24 +292,135 @@ def upload_and_index(files, domain: str, category: str, progress=gr.Progress()):
         except Exception as e:
             results.append(f"| ❌ | {orig_name[:40]} | - | - | {str(e)[:60]} |")
 
-        # 实时刷新: 每次处理完一个文件就更新显示
+        # 每处理完一个文件就 yield 实时更新
         header = [
             f"## 入库进度 ({i+1}/{total})",
             f"| 状态 | 文件名 | Chunks | 字符数 | 耗时 |",
             f"|---|---|---:|---:|---:|",
         ]
-        progress((i + 1) / total, desc=f"[{i+1}/{total}] 完成 {orig_name[:20]}")
+        yield "\n".join(header + results)
 
-    if not results:
-        return "[WARN] 无文件被处理"
-
+    # 全部完成后最终结果
     header = [
         f"## 入库结果 ({ok_count}/{total} 成功)",
         f"| 状态 | 文件名 | Chunks | 字符数 | 耗时 |",
         f"|---|---|---:|---:|---:|",
     ]
     progress(1.0, desc="入库完成!")
-    return "\n".join(header + results)
+    yield "\n".join(header + results)
+
+
+# ========== 崩溃恢复: 自动重新入库 pending 文件 ==========
+
+def auto_recover_pending():
+    """
+    启动时自动检测并恢复 pending 文件（系统异常中断后重新入库）— generator
+
+    流程:
+      1. GET /files?status=pending 快速检查
+         - 无 pending → yield "" 静默退出
+         - 有 pending → yield 警告横幅
+      2. SSE 流式消费 POST /files/recover-pending
+         - 每个文件处理完成后更新进度表格
+         - 全部完成后 yield 最终汇总
+    """
+    # Phase 1: 快速检查 pending 文件
+    result = _api("GET", "/files", params={"status": "pending", "limit": 100})
+    if isinstance(result, str):
+        yield ""   # 后端不可达, 静默跳过
+        return
+
+    files = result.get("files", [])
+    if not files:
+        yield ""   # 无 pending 文件, 清空横幅
+        return
+
+    total = len(files)
+    fnames = [f.get("file_name", "?")[:60] for f in files]
+    yield (f"## ⚠ 检测到 {total} 个文件在上次异常退出时未完成入库\n\n"
+           f"正在自动重新入库，请稍候...\n\n"
+           f"| # | 文件 | 状态 |\n"
+           f"|---|---|\n" +
+           "\n".join(f"| {i+1} | {n} | ⏳ 等待... |" for i, n in enumerate(fnames)))
+
+    # Phase 2: SSE 流式恢复
+    results = [{"name": n, "status": "⏳ 等待..."} for n in fnames]
+    try:
+        resp = requests.post(
+            f"{API_BASE}/files/recover-pending",
+            stream=True,
+            timeout=(30, 1800),   # 30s 连接, 30min 读取 (应对大文件 OCR)
+        )
+
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8", errors="ignore")
+            if line_str.startswith("data: "):
+                try:
+                    data = json.loads(line_str[6:])
+                    event = data.get("event", "")
+
+                    if event == "file_start":
+                        idx = data.get("index", 0)
+                        if idx < len(results):
+                            results[idx]["status"] = "🔄 处理中..."
+
+                    elif event == "file_done":
+                        fname = data.get("file_name", "")[:60]
+                        chunks = data.get("chunks", 0)
+                        chars = data.get("chars", 0)
+                        elapsed = data.get("elapsed_ms", 0) / 1000
+                        for r in results:
+                            if r["name"] == fname:
+                                r["status"] = f"✅ {chunks} chunks, {chars:,} 字符 ({elapsed:.1f}s)"
+                                break
+
+                    elif event == "file_error":
+                        fname = data.get("file_name", "")[:60]
+                        err = data.get("error", "")[:100]
+                        for r in results:
+                            if r["name"] == fname:
+                                r["status"] = f"❌ {err}"
+                                break
+
+                    elif event == "done":
+                        ok_count = data.get("success", 0)
+                        fail_count = data.get("failed", 0)
+                        if fail_count > 0:
+                            yield (f"## ✅ 恢复完成: {ok_count}/{total} 成功, {fail_count} 失败\n\n"
+                                   f"| # | 文件 | 状态 |\n"
+                                   f"|---|---|\n" +
+                                   "\n".join(f"| {i+1} | {r['name']} | {r['status']} |"
+                                             for i, r in enumerate(results)))
+                        else:
+                            yield (f"## ✅ 恢复完成: {total} 个文件全部成功入库\n\n"
+                                   f"| # | 文件 | 状态 |\n"
+                                   f"|---|---|\n" +
+                                   "\n".join(f"| {i+1} | {r['name']} | {r['status']} |"
+                                             for i, r in enumerate(results)))
+                        return
+                except json.JSONDecodeError:
+                    pass
+
+            # 每个事件后 yield 实时进度
+            processed = sum(1 for r in results if r["status"] not in ("⏳ 等待...", "🔄 处理中..."))
+            in_progress = sum(1 for r in results if r["status"] == "🔄 处理中...")
+            status_line = f"## ⚠ 正在恢复文件"
+            if processed > 0 or in_progress > 0:
+                status_line += f" ({processed + in_progress}/{total})"
+            yield (status_line + "\n\n"
+                   f"| # | 文件 | 状态 |\n"
+                   f"|---|---|\n" +
+                   "\n".join(f"| {i+1} | {r['name'][:55]} | {r['status']} |"
+                             for i, r in enumerate(results)))
+
+    except requests.ConnectionError:
+        yield "[ERROR] 无法连接后端，文件恢复跳过 — 请手动重新入库"
+    except requests.Timeout:
+        yield f"[WARN] 文件恢复超时 ({total} 个文件)，请手动重新入库"
+    except Exception as e:
+        yield f"[ERROR] 文件恢复异常: {str(e)[:200]}"
 
 
 # ========== 文件管理 ==========
@@ -576,18 +687,40 @@ def refresh_stats():
     return "\n".join(lines)
 
 
+# ========== Tab切换 自动刷新 ==========
+
+def _on_tab_select_file_mgmt():
+    """切换到文件管理tab时自动刷新列表"""
+    return refresh_file_list("全部", "全部", "")
+
+
+def _on_tab_select_stats():
+    """切换到统计tab时自动刷新"""
+    return refresh_stats()
+
+
 # ========== UI 布局 ==========
 
 CSS = """
 .sidebar { padding: 10px; }
 .chatbot { min-height: 500px; }
+#recovery-banner {
+    border-left: 4px solid #e6a23c;
+    background: #fdf6ec;
+    padding: 0.5em 1em;
+    margin-bottom: 0.5em;
+}
 """
 
 with gr.Blocks(title="榕能电力审图知识库 RAG", theme=gr.themes.Soft(), css=CSS) as demo:
-    # 会话状态
+    # 会话状态 / 入库进度状态
     current_conv = gr.State(value="")
+    upload_status = gr.State(value="")  # 入库进度持久化，切tab不丢
 
-    with gr.Tabs():
+    # 崩溃恢复横幅 (启动时自动检测并恢复 pending 文件)
+    recovery_banner = gr.Markdown("", visible=True, elem_id="recovery-banner")
+
+    with gr.Tabs() as tabs:
         # ===== Tab 1: 智能问答 (聊天界面) =====
         with gr.TabItem("智能问答"):
             with gr.Row():
@@ -682,7 +815,7 @@ with gr.Blocks(title="榕能电力审图知识库 RAG", theme=gr.themes.Soft(), 
                     gr.Markdown("### 上传文件")
                     upload_files = gr.File(label="选择文件",
                         file_count="multiple",
-                        file_types=[".pdf",".doc",".docx",".xls",".xlsx",".txt",".md",".ofd",".ppt",".pptx"])
+                        file_types=[".pdf",".doc",".docx",".xls",".xlsx",".txt",".md",".ppt",".pptx"])
                     with gr.Row():
                         upload_domain = gr.Dropdown(choices=["自动","变电","配电","送电输电","综合"],
                             value="自动", label="域")
@@ -703,7 +836,8 @@ with gr.Blocks(title="榕能电力审图知识库 RAG", theme=gr.themes.Soft(), 
                 outputs=[upload_result])
 
         # ===== Tab 3: 文件管理 =====
-        with gr.TabItem("文件管理"):
+        tab_file_mgmt = gr.TabItem("文件管理")
+        with tab_file_mgmt:
             with gr.Row():
                 with gr.Column(scale=2):
                     with gr.Row():
@@ -743,9 +877,13 @@ with gr.Blocks(title="榕能电力审图知识库 RAG", theme=gr.themes.Soft(), 
             clean_orphan_btn.click(fn=lambda: sync_orphan_files(True),
                 outputs=[op_result, file_tree, file_selector])
 
+            # 初始加载
             demo.load(fn=refresh_file_list,
                 inputs=[file_status_filter, file_domain_filter, file_search],
                 outputs=[file_tree, file_selector])
+
+        # 切换到文件管理tab自动刷新
+        tab_file_mgmt.select(fn=_on_tab_select_file_mgmt, outputs=[file_tree, file_selector])
 
         # ===== Tab 4: 文档检索 =====
         with gr.TabItem("文档检索"):
@@ -763,13 +901,26 @@ with gr.Blocks(title="榕能电力审图知识库 RAG", theme=gr.themes.Soft(), 
                           outputs=[srch_output])
 
         # ===== Tab 5: 统计 =====
-        with gr.TabItem("统计"):
+        tab_stats = gr.TabItem("统计")
+        with tab_stats:
             stats_btn = gr.Button("刷新统计")
             stats_output = gr.Markdown("点击刷新...")
             stats_btn.click(fn=refresh_stats, outputs=[stats_output])
 
+        # 切换到统计tab自动刷新
+        tab_stats.select(fn=_on_tab_select_stats, outputs=[stats_output])
+
     gr.Markdown("---\n*榕能电力审图知识库 RAG v3.0 — 北京时间: {}*".format(
         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+
+    # ===== 页面加载: 自动检测并恢复 pending 文件 =====
+    demo.load(
+        fn=auto_recover_pending,
+        outputs=[recovery_banner],
+    ).then(
+        fn=lambda: refresh_file_list("全部", "全部", ""),
+        outputs=[file_tree, file_selector],
+    )
 
 
 if __name__ == "__main__":

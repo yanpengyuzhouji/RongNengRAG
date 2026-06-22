@@ -14,7 +14,9 @@ python-docx>=1.1.0        # DOCX parsing
 python-pptx>=1.0.0        # PPTX parsing
 openpyxl>=3.1.0           # XLSX parsing
 xlrd>=2.0.1               # XLS parsing
-ofdparser>=1.0.0          # OFD parsing (Chinese fixed-layout docs)
+ofdparser>=1.0.0          # OFD parsing fallback (需要 reportlab, xmltodict 等)
+xmltodict>=0.13.0         # OFD XML 解析 (ofdparser 依赖, 也用于自定义提取器)
+reportlab>=4.0.0          # OFD 字体渲染 (ofdparser 依赖)
 
 # ===== OCR (fallback for scanned PDFs/images) =====
 paddleocr>=2.8.0          # Chinese OCR

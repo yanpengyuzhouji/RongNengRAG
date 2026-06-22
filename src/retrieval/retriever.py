@@ -81,6 +81,7 @@ class SearchResponse:
     elapsed_ms: float
     filter_applied: Optional[str] = None
     expanded_terms: List[str] = field(default_factory=list)
+    coarse_results: Optional[List[RetrievalResult]] = None  # 精排前候选快照（用于评估）
 
 
 class Retriever:
@@ -100,7 +101,8 @@ class Retriever:
         self.retrieval_config = self.config["retrieval"]
 
     def search(self, query: str, top_k: int = None,
-               domain_filter: str = None) -> SearchResponse:
+               domain_filter: str = None,
+               return_coarse_results: bool = False) -> SearchResponse:
         """
         执行三阶段检索
 
@@ -141,6 +143,34 @@ class Retriever:
             dense_weight=self.retrieval_config["dense_weight"],
             sparse_weight=self.retrieval_config["sparse_weight"],
         )
+
+        # ===== 快照粗排候选（用于评估） =====
+        coarse_snapshot = None
+        if return_coarse_results:
+            coarse_snapshot = []
+            for item in candidates:
+                entity = item.get("entity", item)
+                raw_score = item.get("_rerank_score", item.get("distance", 0.0))
+                confidence = round(max(0.0, min(1.0, float(raw_score))), 4)
+                coarse_snapshot.append(RetrievalResult(
+                    chunk_id=entity.get("chunk_id", ""),
+                    text=entity.get("text", ""),
+                    score=item.get("distance", 0.0) if "distance" in item else 0.0,
+                    confidence=confidence,
+                    domain=entity.get("domain", ""),
+                    category=entity.get("category", ""),
+                    file_path=entity.get("file_path", ""),
+                    doc_number=entity.get("doc_number", ""),
+                    voltage_level=entity.get("voltage_level", ""),
+                    publish_level=entity.get("publish_level", ""),
+                    discipline=entity.get("discipline", ""),
+                    equipment_type=entity.get("equipment_type", ""),
+                    year=entity.get("year", 0),
+                    region=entity.get("region", ""),
+                    page_num=entity.get("page_num", 0),
+                    is_drawing=entity.get("is_drawing", False),
+                ))
+            coarse_snapshot.sort(key=lambda x: x.score, reverse=True)
 
         # ===== 阶段2: 交叉编码器精排 =====
         if len(candidates) <= top_k:
@@ -205,6 +235,7 @@ class Retriever:
             elapsed_ms=elapsed,
             filter_applied=aq.filter_expr,
             expanded_terms=aq.expanded_terms,
+            coarse_results=coarse_snapshot,
         )
 
     def search_cross_domain(self, query: str, top_k: int = None) -> Dict[str, SearchResponse]:

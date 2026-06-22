@@ -64,6 +64,35 @@ class Embedder:
         self._loaded = True
         print(f"[embed] 模型就绪: {self.model_name} ({self.provider})")
 
+    def unload(self):
+        """释放 BGE-M3 显存 — OCR进程池/LLM调度前调用
+
+        参照 Reranker.unload() 模式:
+          - del model + gc.collect() + torch.cuda.empty_cache()
+          - Windows WDDM下 empty_cache() 不会将显存归还OS，
+            但释放后的内存在同一CUDA context内可被后续分配复用。
+            对OCR子进程而言，WDDM会将释放的显存标记为可回收缓存，
+            子进程的独立CUDA context可以申请使用这部分显存。
+        """
+        if not self._loaded or self.model is None:
+            return
+        try:
+            import torch
+            import gc
+            del self.model
+            self.model = None
+            self._loaded = False
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print("   [embed] BGE-M3 已卸载，显存已释放")
+        except Exception as e:
+            print(f"   [embed] 卸载异常: {e}")
+
+    def reload(self):
+        """重新加载 BGE-M3 — OCR完成后调用，等同于 _ensure_loaded()"""
+        self._ensure_loaded()
+
     def _init_ollama(self):
         import requests
         print(f"[embed] 使用 Ollama: {self.ollama_url}")

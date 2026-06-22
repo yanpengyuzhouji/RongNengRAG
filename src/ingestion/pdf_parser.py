@@ -70,7 +70,11 @@ class PDFParser:
 
         for page_num in range(sample_count):
             page = doc[page_num]
-            text = page.get_text("text")
+            try:
+                text = page.get_text("text")
+            except Exception as e:
+                print(f"   [parse] 第{page_num + 1}页文本提取失败: {e}")
+                text = ""
             char_count = len(text.strip())
 
             page_data = {
@@ -117,7 +121,11 @@ class PDFParser:
             # ===== 阶段2b: 文字型 PDF → fitz 逐页提取，按需标记 OCR =====
             for page_num in range(sample_count, total_pages):
                 page = doc[page_num]
-                text = page.get_text("text")
+                try:
+                    text = page.get_text("text")
+                except Exception as e:
+                    print(f"   [parse] 第{page_num + 1}页文本提取失败: {e}")
+                    text = ""
                 char_count = len(text.strip())
 
                 page_data = {
@@ -151,8 +159,11 @@ class PDFParser:
 
         # 单页 PDF：提取所有文本
         text = ""
-        for page in doc:
-            text += page.get_text("text")
+        for page_num, page in enumerate(doc):
+            try:
+                text += page.get_text("text")
+            except Exception as e:
+                print(f"   [parse] 单页PDF第{page_num + 1}页文本提取失败: {e}")
 
         doc.close()
         return text.strip()
@@ -166,8 +177,12 @@ class PDFParser:
         doc = fitz.open(filepath)
         blocks = []
 
-        for page in doc:
-            text_blocks = page.get_text("blocks")
+        for page_num, page in enumerate(doc):
+            try:
+                text_blocks = page.get_text("blocks")
+            except Exception as e:
+                print(f"   [parse] 第{page_num + 1}页文本块提取失败: {e}")
+                continue
             for block in text_blocks:
                 x0, y0, x1, y1, text, block_type, block_no = block
                 if text.strip():
@@ -187,6 +202,7 @@ class PDFParser:
         """延迟加载 OCR 引擎 (子进程隔离模式)"""
         if self._ocr_engine is None and self.ocr_config.get("enabled"):
             from ingestion.ocr_engine import OCREngine
+            turbo_cfg = self.ocr_config.get("turbo", {})
             self._ocr_engine = OCREngine(
                 lang=self.ocr_config.get("lang", "ch"),
                 dpi=self.ocr_config.get("dpi", 200),
@@ -196,6 +212,9 @@ class PDFParser:
                 use_gpu=self.ocr_config.get("use_gpu", False),
                 page_delay_ms=self.ocr_config.get("page_delay_ms", 0),
                 ocr_tmp_dir=self.ocr_config.get("ocr_tmp_dir", None),
+                turbo=turbo_cfg.get("enabled", False),
+                turbo_max_workers=turbo_cfg.get("max_workers", 0),
+                max_image_dim=self.ocr_config.get("max_image_dim", 3000),
             )
         return self._ocr_engine
 

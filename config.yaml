@@ -166,6 +166,10 @@ ocr:
   provider: "paddleocr"            # PaddleOCR (子进程隔离)
   lang: "ch"                       # 语言: ch=中文
   dpi: 150                         # PDF 渲染 DPI (越大越清晰，越慢)
+  max_image_dim: 3000              # 图片最大边长 (px)，超限自动缩放
+                                   #   大规格工程图(65"×46")150DPI=9744×6890px
+                                   #   直接OCR: 660s/页 + 12GB显存
+                                   #   缩放3000px: 2.6s/页 + 10GB显存 (254x提速)
   min_text_chars: 50               # 单页最少文本字符，低于此值触发 OCR
   use_subprocess: true             # 子进程隔离 (避免 protobuf 冲突)
   use_gpu: true                    # ✅ GPU 推理 (CUDA paddlepaddle-gpu)
@@ -188,7 +192,15 @@ ocr:
                                    #     ~2GB BGE-Reranker (按需)
                                    #   留 2.5GB buffer 供 LLM 峰值使用
     poll_interval_s: 5             # 显存轮询间隔 (秒)
-    max_wait_s: 600                # 最大等待时间 (秒)，超时强制执行
+    max_wait_s: 300                # 最大等待时间 (秒)，超时强制执行 (从600下调)
+
+  # === OCR 进程池 (turbo模式) ===
+  # 启用后使用 VRAM感知多子进程并行OCR，大文件/批量入库可提速 ~1.7-1.9x
+  turbo:
+    enabled: false                # true=启用OCR进程池, false=单进程安全模式
+    max_workers: 0                # 0=自动(基于VRAM), 1=单进程(safe), 2-3=手动
+    pages_per_worker: 25          # 每批页数 (影响并行粒度)
+    safety_margin_mb: 1500        # VRAM安全裕量, 低于此值自动降级为单进程
 
 # ===== 嵌入模型配置 =====
 embedding:

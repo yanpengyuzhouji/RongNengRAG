@@ -293,8 +293,9 @@ class Chunker:
         if len(text) <= max_chars:
             return [text]
 
-        if depth >= len(self.separators):
-            # 达到最底层，强制按字符拆分
+        # 安全阀: 深度过高或文本过大时直接强制字符拆分, 防止递归溢出
+        if depth >= len(self.separators) or depth > 8 or len(text) > 50000:
+            # 达到最底层或超大文本, 强制按字符拆分
             return self._force_split(text, max_chars, overlap)
 
         separator = self.separators[depth]
@@ -349,7 +350,9 @@ class Chunker:
 
 def load_file_metadata(db_path: str, file_hash: str = None, parsed: int = None) -> List[dict]:
     """从 SQLite 读取文件元数据"""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 

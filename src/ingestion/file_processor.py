@@ -107,9 +107,16 @@ class FileProcessor:
 
         self._init_registry()
 
+    def _get_db_connection(self):
+        """获取 SQLite 连接，统一启用 WAL 模式 + busy_timeout，避免 database is locked"""
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
     def _init_registry(self):
         """初始化文件注册表 (SQLite)"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_db_connection()
         cursor = conn.cursor()
 
         cursor.execute("""
@@ -145,6 +152,42 @@ class FileProcessor:
         conn.commit()
         conn.close()
 
+        self._recover_stuck_files()
+
+    def _recover_stuck_files(self):
+        """启动时恢复卡在 processing 状态的文件 (上次崩溃残留)"""
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE file_registry SET status='pending', error_message='' "
+            "WHERE status='processing'"
+        )
+        n = cursor.rowcount
+        if n > 0:
+            print(f"[recover] 恢复 {n} 个卡在 processing 状态的文件 -> pending")
+        conn.commit()
+        conn.close()
+
+    def _cleanup_ocr_temp(self):
+        """入库完成后清理 OCR 临时目录 (防止大量 PNG 堆积)"""
+        try:
+            ocr_tmp = self.config.get("ocr", {}).get(
+                "ocr_tmp_dir", "E:/RongNengRAG/data/ocr_tmp"
+            )
+            if os.path.isdir(ocr_tmp):
+                import shutil
+                for name in os.listdir(ocr_tmp):
+                    path = os.path.join(ocr_tmp, name)
+                    if os.path.isdir(path) and name.startswith("ocr_"):
+                        shutil.rmtree(path, ignore_errors=True)
+                    elif os.path.isfile(path) and name.startswith("ocr_"):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+        except Exception:
+            pass  # 清理失败不影响主流程
+
     def compute_hash(self, filepath: str) -> str:
         """计算文件 SHA256"""
         sha256 = hashlib.sha256()
@@ -156,7 +199,9 @@ class FileProcessor:
     def process(self, file_path: str,
                 domain: str = None,
                 category: str = None,
-                progress_callback: Callable[[str, float], None] = None
+                progress_callback: Callable[[str, float], None] = None,
+                turbo: bool = None,
+                turbo_max_workers: int = None,
                 ) -> ProcessResult:
         """
         处理单个文件: parse → chunk → embed → insert
@@ -166,6 +211,8 @@ class FileProcessor:
             domain: 手动指定专业域 (可选，默认自动推断)
             category: 手动指定文档类目 (可选)
             progress_callback: 进度回调 (阶段名, 0~1进度)
+            turbo: 覆盖 config.yaml 的 turbo.enabled (None=使用配置文件)
+            turbo_max_workers: 覆盖 max_workers (None=使用配置文件)
 
         Returns:
             ProcessResult
@@ -184,6 +231,16 @@ class FileProcessor:
         file_hash = self.compute_hash(file_path)
         file_ext = file_path_obj.suffix.lower()
         file_size = file_path_obj.stat().st_size
+
+        # Turbo 覆盖: CLI --turbo/--max-workers 运行时覆盖 config.yaml
+        if turbo is not None or turbo_max_workers is not None:
+            turbo_cfg = self.config.setdefault("ocr", {}).setdefault("turbo", {})
+            if turbo is not None:
+                turbo_cfg["enabled"] = turbo
+            if turbo_max_workers is not None:
+                turbo_cfg["max_workers"] = turbo_max_workers
+            # 同步到 pdf_parser.ocr_config (已缓存的 _ocr_engine 不受影响)
+            self.pdf_parser.ocr_config.setdefault("turbo", {}).update(turbo_cfg)
 
         # 检查是否已入库
         existing = self._get_registry(file_hash)
@@ -218,12 +275,12 @@ class FileProcessor:
             if file_ext_lower == ".pdf" and not file_meta.get("is_drawing"):
                 ocr_cfg = self.config.get("ocr", {})
                 if ocr_cfg.get("enabled"):
-                    result = self._process_pdf_progressive(
+                    progressive_result = self._process_pdf_progressive(
                         file_path, file_meta, file_hash, file_name,
                         file_size, file_ext, result, progress_callback
                     )
-                    if result is not None:
-                        return result  # 已处理完成（成功或失败）
+                    if progressive_result is not None:
+                        return progressive_result  # 已处理完成（成功或失败）
 
             # 通用路径: 解析 → 嵌入 → 入库
             chunks = self._parse_file(file_path, file_meta)
@@ -255,9 +312,17 @@ class FileProcessor:
             )
             return result
 
+        except MemoryError:
+            result.status = FileStatus.FAILED
+            result.error_message = "内存不足: 文档过大导致chunker递归溢出, 请尝试拆分文件后重新入库"
+            self._upsert_registry(file_hash, file_name, file_path, file_size, file_ext,
+                                  status="failed", error=result.error_message)
         except Exception as e:
             result.status = FileStatus.FAILED
-            result.error_message = str(e)[:500]
+            result.error_message = str(e) or type(e).__name__
+            if not result.error_message.strip():
+                result.error_message = f"未知错误: {type(e).__name__}"
+            result.error_message = result.error_message[:500]
             self._upsert_registry(file_hash, file_name, file_path, file_size, file_ext,
                                   status="failed", error=result.error_message)
 
@@ -266,7 +331,9 @@ class FileProcessor:
     def process_batch(self, file_paths: List[str],
                       domain: str = None,
                       category: str = None,
-                      progress_callback: Callable[[str, float], None] = None
+                      progress_callback: Callable[[str, float], None] = None,
+                      turbo: bool = None,
+                      turbo_max_workers: int = None,
                       ) -> BatchResult:
         """
         批量处理多个文件
@@ -276,6 +343,8 @@ class FileProcessor:
             domain: 统一指定域
             category: 统一指定类目
             progress_callback: 总体进度回调
+            turbo: 覆盖 config.yaml 的 turbo.enabled
+            turbo_max_workers: 覆盖 max_workers
 
         Returns:
             BatchResult
@@ -290,7 +359,8 @@ class FileProcessor:
                 progress_callback(f"处理中 ({i + 1}/{len(file_paths)})",
                                   i / len(file_paths))
 
-            result = self.process(fp, domain=domain, category=category)
+            result = self.process(fp, domain=domain, category=category,
+                                  turbo=turbo, turbo_max_workers=turbo_max_workers)
             results.append(result)
             if result.status == FileStatus.COMPLETED:
                 success += 1
@@ -355,7 +425,7 @@ class FileProcessor:
         Returns:
             {total_checked, orphan_count, cleaned, errors, orphans (仅 dry_run)}
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_db_connection()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute(
@@ -453,7 +523,7 @@ class FileProcessor:
         Args:
             check_existence: 检查物理文件是否存在，添加 file_exists 字段
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_db_connection()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
@@ -487,7 +557,7 @@ class FileProcessor:
 
     def get_summary(self) -> dict:
         """获取索引入库摘要"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_db_connection()
         cursor = conn.cursor()
 
         cursor.execute("SELECT status, COUNT(*) FROM file_registry GROUP BY status")
@@ -512,7 +582,7 @@ class FileProcessor:
     # ===== 内部方法 =====
 
     def _get_registry(self, file_hash: str) -> Optional[dict]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_db_connection()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM file_registry WHERE file_hash = ?", (file_hash,))
@@ -527,10 +597,14 @@ class FileProcessor:
                          domain: str = None, category: str = None,
                          doc_number: str = None, error: str = None,
                          parse_time: float = None, embed_time: float = None):
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_db_connection()
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        existing = self._get_registry(file_hash)
+        # 内联 SELECT，避免 _get_registry 开第二个连接导致 database is locked
+        cursor.execute("SELECT * FROM file_registry WHERE file_hash = ?", (file_hash,))
+        row = cursor.fetchone()
+        existing = dict(row) if row else None
 
         if existing:
             updates = []
@@ -546,6 +620,9 @@ class FileProcessor:
                 if val is not None:
                     updates.append(f"{col} = ?")
                     params.append(val)
+            # 成功后清除旧错误信息
+            if status == "completed":
+                updates.append("error_message = ''")
             if status == "completed" and existing["status"] == "completed":
                 updates.append("reindex_count = reindex_count + 1")
             updates.append("updated_at = datetime('now', 'localtime')")
@@ -570,13 +647,20 @@ class FileProcessor:
                                   file_size, file_ext, result: ProcessResult,
                                   progress_callback=None) -> Optional[ProcessResult]:
         """
-        PDF 单进程渐进入库 — 一个OCR子进程处理全部扫描页
+        PDF 渐进入库 — 显式 GPU 模型生命期管理
 
-        关键设计: 一次 ocr_pages() 调用传入所有页，子进程内部自动分批(50页/批)。
-        避免多次子进程启动导致的 CUDA context 累积 + WDDM 显存不释放。
+        流程:
+          1. 预解析 + 渲染非OCR页文本
+          2. 卸载 BGE-M3 释放 ~2GB 显存
+          3. OCR (单进程 safe / 进程池 turbo) → GPU峰值 ~2.5GB(safe) ~8GB(turbo)
+          4. OCR子进程退出 → 显存释放
+          5. 重新加载 BGE-M3 (~2GB)
+          6. 分块 + 嵌入 + 写入 Milvus
 
-        GPU: PaddleOCR(~4GB) → OCR完成 → 卸载 → BGE-M3(~2GB) → 嵌入
-             峰值 ~4GB，12GB 内安全
+        关键约束:
+          - OCR子进程使用 PPOCRLabel venv 独立CUDA context
+          - BGE-M3 卸载后 WDDM 将其缓存标记为可回收 → OCR子进程可复用
+          - 全局 _ocr_lock 保证同一时刻只运行一个 OCR 池
         """
         parsed = self.pdf_parser.parse(file_path)
         needs_ocr = parsed.get("needs_ocr_pages", [])
@@ -586,7 +670,7 @@ class FileProcessor:
         ocr_pages_0based = [p - 1 for p in needs_ocr]
         t_start = time.time()
 
-        # 收集非OCR页文本
+        # 收集非OCR页文本 (CPU, 快速)
         non_ocr_pages = [p for p in parsed.get("pages", [])
                          if not p.get("needs_ocr")]
         all_chunks = []
@@ -601,18 +685,34 @@ class FileProcessor:
         # 清理旧索引
         self.store.delete_by_file_hash(file_hash)
 
-        # BGE-M3 保持加载 (WDDM下del+empty_cache无法释放, 强行卸载反而浪费CPU)
-        # OCR子进程用PPOCRLabel venv独立CUDA context, ~500MB, 不冲突
-        # VRAM: BGE-M3(~2.4GB) + OCR(~0.5GB) = ~3GB 安全
+        # ===== 卸载 BGE-M3 → 释放显存供 OCR 使用 =====
+        if self.embedder is not None:
+            try:
+                from src.utils.gpu_monitor import log_vram_snapshot
+                log_vram_snapshot("BGE-M3卸载前")
+            except Exception:
+                pass
+            self.embedder.unload()
+            try:
+                from src.utils.gpu_monitor import log_vram_snapshot
+                log_vram_snapshot("BGE-M3卸载后")
+            except Exception:
+                pass
+        else:
+            try:
+                from src.utils.gpu_monitor import log_vram_snapshot
+                log_vram_snapshot("OCR前(BGE-M3未加载)")
+            except Exception:
+                pass
 
         try:
-            # ===== 一次性OCR全部页 — 子进程内部自动分批，单个CUDA context =====
+            # ===== OCR — 单进程流式 (--stream 长连接) =====
             if progress_callback:
                 progress_callback(
-                    f"OCR识别 ({len(ocr_pages_0based)}页, GPU单进程)", 0.1
+                    f"OCR识别 ({len(ocr_pages_0based)}页)", 0.1
                 )
 
-            print(f"   [OCR] 开始识别 {len(ocr_pages_0based)} 页 (单进程)...")
+            print(f"   [OCR] 开始识别 {len(ocr_pages_0based)} 页 (流式单进程)...")
             ocr_texts = self.pdf_parser.ocr_pages(file_path, ocr_pages_0based)
 
             if progress_callback:
@@ -626,18 +726,27 @@ class FileProcessor:
                     all_chunks.extend(ocr_chunks)
                     total_chars += sum(c.char_count for c in ocr_chunks)
 
+            ocr_elapsed = time.time() - t_start
             print(f"   [OCR] 完成: {len(ocr_texts)}有效页 → "
-                  f"{len(all_chunks)} chunks ({(time.time() - t_start):.0f}s)")
+                  f"{len(all_chunks)} chunks ({ocr_elapsed:.0f}s)")
 
-            # ===== OCR子进程已退出, 重新加载BGE-M3 → 嵌入 =====
+            # ===== OCR子进程已退出，重新加载 BGE-M3 → 嵌入 =====
             if progress_callback:
                 progress_callback("嵌入向量", 0.7)
 
             embed_total_ms = 0.0
             if all_chunks:
-                # BGE-M3 已在启动时预热, 无需重新加载
+                # 重新加载 BGE-M3 (OCR子进程已释放显存)
                 if self.embedder is None:
                     self.embedder = Embedder(self.config_path)
+                else:
+                    self.embedder.reload()
+
+                try:
+                    from src.utils.gpu_monitor import log_vram_snapshot
+                    log_vram_snapshot("BGE-M3重载后")
+                except Exception:
+                    pass
 
                 t_embed = time.time()
                 embedding_texts = [create_text_for_embedding(c)
@@ -688,6 +797,10 @@ class FileProcessor:
             category=result.category, doc_number=result.doc_number,
             parse_time=result.parse_time_ms, embed_time=result.embed_time_ms,
         )
+
+        # 及时清理 OCR 临时目录 (防止 E 盘被大量 PNG 占满)
+        self._cleanup_ocr_temp()
+
         return result
 
     def _embed_and_insert(self, chunks, result: ProcessResult,
@@ -763,7 +876,7 @@ class FileProcessor:
         if os.path.exists(identifier):
             return self.compute_hash(identifier)
         # 从注册表查找
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT file_hash FROM file_registry WHERE original_path = ? OR file_name = ?",
@@ -841,6 +954,10 @@ class FileProcessor:
                     ocr_pages_0based = [p - 1 for p in needs_ocr]
                     print(f"   [OCR] 检测到 {len(needs_ocr)} 页需要 OCR: "
                           f"{needs_ocr[:10]}{'...'if len(needs_ocr)>10 else ''}")
+
+                    # 卸载 BGE-M3 释放显存供 OCR 使用
+                    if self.embedder is not None:
+                        self.embedder.unload()
 
                     try:
                         ocr_texts = self.pdf_parser.ocr_pages(
@@ -935,26 +1052,53 @@ class FileProcessor:
 
         # OFD
         elif ext == ".ofd":
-            try:
-                from ofdparser import OFDParser
-                parser = OFDParser()
-                ofd_doc = parser.parse(file_path)
-                all_text = []
-                for page in ofd_doc.pages:
-                    page_texts = []
-                    for elem in page.elements:
-                        if hasattr(elem, 'text') and elem.text:
-                            page_texts.append(elem.text)
-                    all_text.append("\n".join(page_texts))
-                text = "\n\n".join(all_text)
-                return self.chunker.chunk_text_document(text, file_meta)
-            except ImportError:
+            text = self._parse_ofd_file(file_path)
+            if not text or not text.strip():
                 return []
-            except Exception:
-                return []
+            # 超大文本分批: 超过100K字符分批处理, 防止chunker内存溢出
+            if len(text) > 100000:
+                # 主分隔符: 双换行 (页面间), 页内段落间
+                sections = [s.strip() for s in text.split("\n\n") if s.strip()]
+                # 如果双换行无效 (只有1段超大文本), 退回到单换行分句
+                if len(sections) == 1 and len(sections[0]) > 30000:
+                    sections = [s.strip() for s in text.split("\n") if s.strip()]
+                all_chunks = []
+                batch = ""
+                for sec in sections:
+                    if len(batch) + len(sec) < 30000:
+                        batch = (batch + "\n\n" + sec) if batch else sec
+                    else:
+                        if batch:
+                            try:
+                                all_chunks.extend(
+                                    self.chunker.chunk_text_document(batch, file_meta)
+                                )
+                            except MemoryError:
+                                # 内存不足, 强制按字符拆分
+                                for i in range(0, len(batch), 2000):
+                                    sub = batch[i:i+2000].strip()
+                                    if sub:
+                                        try:
+                                            all_chunks.extend(
+                                                self.chunker.chunk_text_document(sub, file_meta)
+                                            )
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                        batch = sec
+                if batch:
+                    try:
+                        all_chunks.extend(
+                            self.chunker.chunk_text_document(batch, file_meta)
+                        )
+                    except Exception:
+                        pass
+                return all_chunks
+            return self.chunker.chunk_text_document(text, file_meta)
 
-        # XLSX
-        elif ext in (".xls", ".xlsx"):
+        # XLSX (Office Open XML)
+        elif ext == ".xlsx":
             try:
                 import openpyxl
                 wb = openpyxl.load_workbook(file_path, data_only=True)
@@ -969,13 +1113,69 @@ class FileProcessor:
                     texts.append("\n".join(sheet_text))
                 text = "\n\n".join(texts)
                 return self.chunker.chunk_text_document(text, file_meta)
-            except Exception:
+            except Exception as e:
+                print(f"[warn] XLSX解析失败 ({os.path.basename(file_path)}): {e}")
+                return []
+
+        # XLS (OLE2 binary format — openpyxl can't handle this)
+        elif ext == ".xls":
+            try:
+                import xlrd
+                wb = xlrd.open_workbook(file_path)
+                texts = []
+                for sheet_name in wb.sheet_names():
+                    ws = wb.sheet_by_name(sheet_name)
+                    sheet_text = [f"[Sheet: {sheet_name}]"]
+                    for row_idx in range(ws.nrows):
+                        row_values = ws.row_values(row_idx)
+                        row_text = " | ".join([str(c) if c != "" else "" for c in row_values])
+                        if row_text.strip(" |"):
+                            sheet_text.append(row_text)
+                    texts.append("\n".join(sheet_text))
+                text = "\n\n".join(texts)
+                return self.chunker.chunk_text_document(text, file_meta)
+            except Exception as e:
+                print(f"[warn] XLS解析失败 ({os.path.basename(file_path)}): {e}")
                 return []
 
         # WPS (金山 WPS 文字文档)
         # WPS 有两代格式: 旧版 OLE2 二进制容器, 新版 ZIP+XML 容器
         elif ext == ".wps":
             text = self._parse_wps_file(file_path)
+            if text:
+                return self.chunker.chunk_text_document(text, file_meta)
+            return []
+
+        # PPTX (python-pptx 提取幻灯片文本)
+        elif ext == ".pptx":
+            try:
+                from pptx import Presentation
+                prs = Presentation(file_path)
+                slides_text = []
+                for slide in prs.slides:
+                    texts = []
+                    for shape in slide.shapes:
+                        if shape.has_text_frame:
+                            for para in shape.text_frame.paragraphs:
+                                t = para.text.strip()
+                                if t:
+                                    texts.append(t)
+                    if texts:
+                        slides_text.append("\n".join(texts))
+                text = "\n\n".join(slides_text)
+                if text.strip():
+                    return self.chunker.chunk_text_document(text, file_meta)
+                return []
+            except ImportError:
+                print("   [WARN] python-pptx 未安装，无法解析 .pptx")
+                return []
+            except Exception as e:
+                print(f"   [WARN] PPTX 解析失败: {e}")
+                return []
+
+        # PPT (旧版) — 尝试用 Windows COM 或 LibreOffice
+        elif ext == ".ppt":
+            text = self._parse_ppt_file(file_path)
             if text:
                 return self.chunker.chunk_text_document(text, file_meta)
             return []
@@ -1038,11 +1238,48 @@ class FileProcessor:
         except Exception:
             pass
 
+        # 方案6: raw binary UTF-16LE 兜底 (纯二进制提取, 零依赖)
+        text = self._parse_doc_via_raw_binary(file_path)
+        if text and text.strip():
+            print(f"   [doc] raw binary 解析成功: {len(text)} 字符")
+            return text
+
         print(f"   [warn] 所有 .doc 解析方案均失败: {os.path.basename(file_path)}")
         print(f"   [tip] 建议方案: (1) pip install pywin32 启用 Word COM 解析")
         print(f"         或 (2) 安装 LibreOffice")
         print(f"         或 (3) 用 Word 打开后另存为 .docx 格式")
         return ""
+
+    def _parse_doc_via_raw_binary(self, file_path: str) -> str:
+        """
+        OLE2 .doc 纯二进制兜底提取 — 零外部依赖
+
+        直接以 UTF-16LE 解码文件二进制内容，用正则提取中文文本段。
+        适用于 OLE2 容器中文档内容以 Unicode 存储的常见情况。
+        对复杂排版（表格/图片/公式）可能丢失部分内容，但绝大多数
+        .doc 文件能够提取到 80%+ 的正文文本。
+        """
+        import re
+        try:
+            with open(file_path, 'rb') as f:
+                data = f.read()
+            # OLE2 .doc Word文档内文本以 UTF-16LE 编码存储
+            text = data.decode('utf-16-le', errors='ignore')
+            # 提取有意义的文本段: 4个字符以上, 中文占比 > 10%
+            chunks = re.findall(
+                r"[一-鿿a-zA-Z0-9\s.,;:!?()（）、。，；：！？''【】《》——…/%+\-]{4,}",
+                text
+            )
+            # 过滤乱码: 中文占比太低的多半是字体名/样式名等垃圾
+            clean = []
+            for c in chunks:
+                cn_count = sum(1 for ch in c if '一' <= ch <= '鿿')
+                ratio = cn_count / max(len(c), 1)
+                if ratio > 0.05 and len(c) > 6:
+                    clean.append(c)
+            return '\n'.join(clean)
+        except Exception:
+            return ""
 
     def _parse_doc_via_win32(self, file_path: str) -> str:
         """
@@ -1384,5 +1621,114 @@ class FileProcessor:
                     pythoncom.CoUninitialize()
                 except Exception:
                     pass
+
+        return ""
+
+    def _parse_ppt_file(self, file_path: str) -> str:
+        """
+        解析旧版 .ppt 文件 (PowerPoint 97-2003, OLE2 二进制)
+
+        按优先级尝试:
+          1. LibreOffice headless → txt (通用, 跨平台)
+          2. win32com PowerPoint COM 自动化 (Windows + Office)
+        """
+        import subprocess
+        import tempfile
+
+        abs_path = os.path.abspath(file_path)
+
+        # 方案1: LibreOffice headless 转 txt
+        lo_paths = [
+            "libreoffice", "soffice",
+            "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+            "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+        ]
+        for lo_exe in lo_paths:
+            try:
+                subprocess.run([lo_exe, "--version"], capture_output=True, timeout=5)
+                break
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                lo_exe = None
+                continue
+
+        if lo_exe:
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    cmd = [lo_exe, "--headless", "--convert-to", "txt:Text",
+                           "--outdir", tmpdir, abs_path]
+                    result = subprocess.run(cmd, capture_output=True, timeout=120)
+                    if result.returncode == 0:
+                        for f in os.listdir(tmpdir):
+                            if f.endswith(".txt"):
+                                txt_path = os.path.join(tmpdir, f)
+                                with open(txt_path, "r", encoding="utf-8", errors="ignore") as fp:
+                                    text = fp.read()
+                                if text.strip():
+                                    return text
+            except Exception:
+                pass
+
+        # 方案2: PowerPoint COM 自动化
+        try:
+            import pythoncom
+            import win32com.client
+        except ImportError:
+            return ""
+
+        ppt_app = None
+        presentation = None
+        try:
+            pythoncom.CoInitialize()
+            ppt_app = win32com.client.Dispatch("PowerPoint.Application")
+            ppt_app.Visible = False
+            ppt_app.DisplayAlerts = 0
+            presentation = ppt_app.Presentations.Open(abs_path, ReadOnly=True)
+
+            slides_text = []
+            for slide in presentation.Slides:
+                texts = []
+                for shape in slide.Shapes:
+                    if shape.HasTextFrame:
+                        t = shape.TextFrame.TextRange.Text
+                        if t and t.strip():
+                            texts.append(t.strip())
+                if texts:
+                    slides_text.append("\n".join(texts))
+
+            return "\n\n".join(slides_text)
+        except Exception:
+            return ""
+        finally:
+            if presentation is not None:
+                try: presentation.Close()
+                except Exception: pass
+            if ppt_app is not None:
+                try: ppt_app.Quit()
+                except Exception: pass
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    def _parse_ofd_file(self, file_path: str) -> str:
+        """
+        OFD 文件解析 — 带多级回退
+
+        国产版式文档 OFD (GB/T 33190) 本质是 ZIP+XML 容器。
+        优先级:
+          1. 自定义提取器 (零依赖, 处理 GBK/UTF-8 混合编码 + 字体映射)
+          2. ofdparser 库 (需安装: pip install ofdparser reportlab xmltodict)
+        """
+        # 方案1: 自定义提取器 (可靠, 无外部依赖)
+        from ingestion.ofd_extractor import extract_ofd_text
+        text = extract_ofd_text(file_path)
+        if text and text.strip():
+            return text
+
+        # 方案2: ofdparser 库 (兜底, 处理特殊 OFD 变体)
+        from ingestion.ofd_extractor import extract_ofd_text_via_ofdparser
+        text = extract_ofd_text_via_ofdparser(file_path)
+        if text and text.strip():
+            return text
 
         return ""

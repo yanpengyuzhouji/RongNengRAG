@@ -25,21 +25,37 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from ingestion.file_processor import FileProcessor, FileStatus
 
 
+def _get_turbo_kwargs(args) -> dict:
+    """从 CLI args 提取 turbo 相关参数"""
+    kwargs = {}
+    if hasattr(args, 'turbo') and args.turbo:
+        kwargs['turbo'] = True
+    elif hasattr(args, 'safe') and args.safe:
+        kwargs['turbo'] = False
+    if hasattr(args, 'max_workers') and args.max_workers is not None:
+        kwargs['turbo_max_workers'] = args.max_workers
+    return kwargs
+
+
 def cmd_add_file(args):
     """添加单个文件"""
     processor = FileProcessor()
-    print(f"📄 处理单个文件: {args.file}")
+    turbo_kw = _get_turbo_kwargs(args)
+    mode = "[turbo]" if turbo_kw.get('turbo') else "[safe]"
+    print(f"File ({mode}): {args.file}")
     result = processor.process(args.file, domain=args.domain, category=args.category,
-                               progress_callback=_progress)
+                               progress_callback=_progress, **turbo_kw)
     _print_result(result)
 
 
 def cmd_add_files(args):
     """添加多个文件"""
     processor = FileProcessor()
-    print(f"📦 处理 {len(args.files)} 个文件...")
+    turbo_kw = _get_turbo_kwargs(args)
+    mode = "[turbo]" if turbo_kw.get('turbo') else "[safe]"
+    print(f"Batch {len(args.files)} files ({mode})...")
     batch = processor.process_batch(args.files, domain=args.domain, category=args.category,
-                                    progress_callback=_progress)
+                                    progress_callback=_progress, **turbo_kw)
     _print_batch(batch)
 
 
@@ -47,6 +63,8 @@ def cmd_add_dir(args):
     """从目录批量添加"""
     import glob as globmod
     processor = FileProcessor()
+    turbo_kw = _get_turbo_kwargs(args)
+    mode = "[turbo]" if turbo_kw.get('turbo') else "[safe]"
 
     # 收集支持的文件
     exts = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ofd", ".txt", ".md"}
@@ -56,15 +74,15 @@ def cmd_add_dir(args):
             if os.path.splitext(fn)[1].lower() in exts:
                 files.append(os.path.join(root, fn))
 
-    print(f"📂 目录: {args.dir}")
-    print(f"   发现 {len(files)} 个可处理文件")
+    print(f"Dir: {args.dir} ({mode})")
+    print(f"   Found {len(files)} processable files")
 
     if args.limit and args.limit > 0:
         files = files[:args.limit]
-        print(f"   限制处理: {len(files)} 个")
+        print(f"   Limit: {len(files)}")
 
     batch = processor.process_batch(files, domain=args.domain, category=args.category,
-                                    progress_callback=_progress)
+                                    progress_callback=_progress, **turbo_kw)
     _print_batch(batch)
 
 
@@ -158,6 +176,12 @@ def main():
     for p in [p_file, p_files, p_dir]:
         p.add_argument("--domain", default=None, help="指定专业域")
         p.add_argument("--category", default=None, help="指定类目")
+        p.add_argument("--turbo", action="store_true", default=None,
+                       help="启用OCR进程池 (VRAM感知并行, 大幅提速)")
+        p.add_argument("--safe", action="store_true", default=None,
+                       help="强制安全模式 (单OCR进程, 默认)")
+        p.add_argument("--max-workers", type=int, default=None,
+                       help="turbo模式最大OCR并行数 (0=自动, 1-3=手动)")
     p_dir.add_argument("--limit", type=int, default=None, help="限制文件数")
 
     # list
@@ -176,6 +200,12 @@ def main():
     # reindex
     p_reidx = sub.add_parser("reindex", help="重建文件索引")
     p_reidx.add_argument("identifier", help="文件 hash 或路径")
+    p_reidx.add_argument("--turbo", action="store_true", default=None,
+                         help="启用OCR进程池")
+    p_reidx.add_argument("--safe", action="store_true", default=None,
+                         help="强制安全模式")
+    p_reidx.add_argument("--max-workers", type=int, default=None,
+                         help="turbo模式最大并行数")
 
     args = parser.parse_args()
 

@@ -41,9 +41,16 @@ class FileWalker:
 
         self._init_db()
 
+    def _get_db_connection(self):
+        """获取 SQLite 连接，统一启用 WAL + busy_timeout 防锁"""
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
     def _init_db(self):
         """初始化 SQLite 元数据库"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_db_connection()
         cursor = conn.cursor()
 
         cursor.execute("""
@@ -290,7 +297,7 @@ class FileWalker:
         """
         existing_hashes = set()
         if resume:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._get_db_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT file_hash FROM files")
             existing_hashes = {row[0] for row in cursor.fetchall()}
@@ -307,7 +314,7 @@ class FileWalker:
         }
 
         batch = []
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_db_connection()
 
         try:
             for filepath in self.kb_path.rglob("*"):
