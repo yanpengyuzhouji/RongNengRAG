@@ -10,6 +10,7 @@
 
 import re
 import yaml
+import jieba
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
 
@@ -130,20 +131,43 @@ class QueryAnalyzer:
 
     def _classify_domain(self, query: str) -> Optional[str]:
         """
-        基于关键词典对查询进行域分类
-        统计每个域的关键词命中数
+        基于关键词典对查询进行域分类（jieba分词 + 词边界匹配）
+
+        使用 jieba 分词后逐词匹配，避免子串误判:
+          - "配电装置" 不会因含 "配电" 而被误判为配电域
+          - "10kV变电站" 不会因 "10kV" 被配电域抢走
         """
+        # jieba 分词
+        words = set(jieba.lcut(query))
+
         scores = {}
         for domain, keywords in self.domain_keywords.items():
             score = 0
             for kw in keywords:
-                if kw in query:
+                # 精确词匹配: kw 必须作为完整词出现在分词结果中
+                if kw in words:
                     score += 1
             if score > 0:
                 scores[domain] = score
 
         if not scores:
             return None
+
+        # 消歧规则: 当变电和配电同时命中时，检查是否有强信号
+        if "变电" in scores and "配电" in scores:
+            # "配电装置" 在变电关键词中 → 有"变电站"等强变电信号时归变电
+            strong_biandian = {"变电站", "GIS", "主变", "换流站", "变电所",
+                               "电气一次", "电气二次", "继电保护", "直流系统", "综合自动化"}
+            if any(w in words for w in strong_biandian):
+                scores["变电"] += 2  # 强信号加权
+
+        # 消歧规则: GB50061 等66kV线路规范归属送电输电，非配电
+        # "架空线路""杆塔""导线""输电" 是送电输电强信号
+        if "送电输电" in scores:
+            strong_songdian = {"架空线路", "杆塔", "导线", "地线", "OPGW",
+                               "绝缘子", "防振锤", "跨越", "耐张", "输电"}
+            if any(w in words for w in strong_songdian):
+                scores["送电输电"] += 2
 
         # 返回得分最高的域
         best = max(scores, key=scores.get)
@@ -152,7 +176,7 @@ class QueryAnalyzer:
         if len(scores) > 1:
             scores_list = sorted(scores.values(), reverse=True)
             if scores_list[0] == scores_list[1]:
-                return None  # 跨域查询
+                return None  # 跨域查询，释放域过滤
 
         return best
 

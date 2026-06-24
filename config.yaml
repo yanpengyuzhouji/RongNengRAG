@@ -68,8 +68,8 @@ domain_keywords:
          "电气一次", "电气二次", "继电保护", "综合自动化", "直流系统"]
   配电: ["配电", "配网", "配电网", "10kV", "20kV", "箱变", "配电室", "充电站",
          "充电桩", "台区", "低压", "光伏", "分布式", "环网柜"]
-  送电输电: ["输电", "送电", "架空线路", "杆塔", "电缆线路", "线路走廊", "导线",
-              "地线", "OPGW", "绝缘子", "防振锤", "跨越", "耐张"]
+  送电输电: ["输电", "送电", "架空线路", "杆塔", "电缆线路", "电力电缆", "线路走廊", "导线",
+              "地线", "OPGW", "绝缘子", "防振锤", "跨越", "耐张", "电磁环境", "电缆敷设", "架空电力线路"]
   综合: ["省公司", "市公司", "发文", "管理制度", "费用标准", "定额", "信息价"]
 
 # ===== 标签关键词典 =====
@@ -232,8 +232,8 @@ retrieval:
   coarse_top_k: 50         # Stage 1: hybrid search candidates
   fine_top_k: 15           # Stage 2: after reranking
   rrf_k: 60                # Reciprocal Rank Fusion parameter
-  dense_weight: 0.5        # Dense embedding weight in hybrid
-  sparse_weight: 0.5       # Sparse lexical weight (现在有真实稀疏向量，提高权重)
+  dense_weight: 0.7        # Dense embedding weight in hybrid (标准规范语义更重要)
+  sparse_weight: 0.3       # Sparse lexical weight (关键词匹配降权，减少域间串扰)
   nprobe: 16               # IVF index probe count
   confidence:              # 置信度校准
     min_score_threshold: 0.3

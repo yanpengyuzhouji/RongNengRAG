@@ -1,5 +1,142 @@
 # 开发日志
 
+## 2026-06-22
+
+### RAG 检索质量修复 — 12题跨域诊断 + 4项代码修复
+
+- **12题跨域测试** (变电/配电/送电输电/综合 各3题)，基线: 域分类准确率 67%，关键文件命中率 8%
+
+**Bug修复 — 域分类子串误判** (`src/retrieval/query_analyzer.py`):
+  - `if kw in query` 字符子串匹配 → jieba 分词 + 词边界精确匹配
+  - "配电装置" 不再因含 "配电" 误判为配电域
+  - 新增消歧规则: 变电/配电同时命中时，强变电信号("变电站""GIS"等)加权+2
+  - 新增消歧规则: 送电输电强信号("架空线路""杆塔"等)加权+2
+  - 域分类准确率: 67% → 75%
+
+**Bug修复 — RRF 权重死代码** (`src/ingestion/milvus_store.py`):
+  - `RRFRanker(k=60)` 完全忽略 dense_weight/sparse_weight → 改用 `WeightedRanker(dense_weight, sparse_weight)`
+  - config.yaml: dense_weight 0.5→0.7, sparse_weight 0.5→0.3 (标准规范语义更重要)
+  - 权重配置对检索排名真正生效
+
+**优化 — 元数据加权从乘法改为加法** (`src/retrieval/reranker.py`):
+  - `_compute_metadata_boost()`: 乘法叠加(最高1.58x) → 加法归一化+上限1.15x
+  - 文件名匹配: 1.30x → +0.10; 域匹配: 1.05x → +0.05; 电压匹配: 1.10x → +0.05
+  - 防止元数据统治语义评分
+
+**Bug修复 — 完整文档注入撑爆 LLM 上下文** (`src/retrieval/retriever.py`):
+  - 根因: query 含 "根据GB50052-2009" → FileRegistry 检测文档编号 → get_full_document() 注入 28000+ 字符全文档 → 超出 32768 token 窗口 → LLM 只输出 "基于" 2字
+  - 修复: `build_context_with_file_injection()` 中添加上下文预算检查，完整文档超过 10000 字符自动截断
+  - 修复前: answer="基于"(2字) → 修复后: answer=1342字+5条引用
+
+**配置 — 送电输电关键词补强** (`config.yaml`):
+  - 新增 "电力电缆""电磁环境""电缆敷设""架空电力线路" → 修复 S09 回归
+
+### 技术文档全面更新
+
+- **更新** `README.md` — 项目结构、架构图、文档类型支持、GPU 显存管理、评估框架
+- **更新** `TECHNICAL.md` — 新增 OFD 提取器、评估框架、OCR 显存编排流程、communicate() 根因修复、超大图缩放
+- **更新** `CHANGELOG.md` — 补充 2026-06-12 至 2026-06-22 开发日志
+- **更新** `docs/资料分类与知识库入库说明.md` — OCR 参数更新、性能基准更新、OFD 格式说明
+
+### OFD 文档自定义提取器
+
+- **新增** `src/ingestion/ofd_extractor.py` — 国产版式文档 GB/T 33190 文本提取:
+  - 纯标准库实现 (zipfile + xml.etree)，零额外依赖
+  - 支持直接 Unicode 文本、GBK/GB18030 编码 TextCode
+  - 支持 CID-keyed 字体 CMap 字形映射
+  - ofdparser 作为回退方案
+- **修改** `requirements.txt` — 添加 `xmltodict>=0.13.0` 和 `reportlab>=4.0.0` (ofdparser 依赖)
+
+### OCR 超大图自动缩放
+
+- **修改** `src/ingestion/ocr_engine.py` — `_render_page_to_png()` 新增 `max_dim` 参数:
+  - PDF 渲染 PNG 后，边长超过 `max_image_dim` 时用 Pillow LANCZOS 缩放
+  - 大规格工程图 (65"×46") 150DPI = 9744×6890px
+  - 直接 OCR: 660s/页 + 12GB 显存
+  - 缩放至 3000px: 2.6s/页 + ~10GB 显存 (254x 提速)
+- **修改** `config.yaml` — 新增 `ocr.max_image_dim: 3000` 配置项
+
+### OCR Turbo 进程池配置
+
+- **修改** `config.yaml` — 新增 `ocr.turbo` 配置节:
+  - `enabled: false` (默认关闭，安全模式)
+  - `max_workers: 0` (0=VRAM 感知自动)
+  - `pages_per_worker: 25`
+  - `safety_margin_mb: 1500`
+- **新增** `ocr_engine.py` — `ocr_pool_map()` VRAM 感知多子进程并行，大文件可提速 ~1.7-1.9x
+
+---
+
+## 2026-06-19
+
+### 根因修复: subprocess stderr 管道死锁 → WDDM 显存爆炸
+
+- **根因分析**:
+  - PaddleOCR 初始化输出大量 ANSI 彩色日志到 stderr (~200KB/次)
+  - 旧方案使用 `--stream` 模式 + `stderr=PIPE`，stderr 缓冲区仅 64KB (OS 管道)
+  - 主进程未及时读取 stderr → 管道满 → 子进程 `write()` 阻塞 → 僵尸状态
+  - 僵尸子进程持有 CUDA context (1.5-3GB)，WDDM 无法回收
+  - 每轮 OCR 泄漏 1.5-3GB → 三轮后 12GB 全满 → OOM
+- **修复** `src/ingestion/ocr_engine.py`:
+  - `_spawn_ocr_worker()` — 从 `--stream` Popen+管道 改为 `Popen` + `communicate(input=json, timeout=N)`
+  - `communicate()` 内部使用线程并发读取 stdout/stderr，**无死锁风险**
+  - 超时后 `cmd //c taskkill /F /T /PID` 杀整个进程树 (含 PaddlePaddle CUDA 孙进程)
+  - 移除 `--stream` 模式全部代码，简化为单次 communicate 调用
+
+### 根本解决显存溢出: 单 OCR 子进程处理全部页面
+
+- **修改** `src/ingestion/ocr_engine.py`:
+  - 从双槽并行 (2 OCR 子进程) 回退到单子进程批量模式
+  - 所有 OCR 页面在一个子进程中一次性批量处理
+  - 通过 `_ocr_lock` 全局互斥锁确保同时最多 1 个 OCR 子进程
+  - 防止 2+ PaddleOCR 实例同时占用 GPU 导致 OOM
+
+### OCR 入库前卸载 BGE-M3: 防止两模型并存爆显存
+
+- **修改** `src/ingestion/file_processor.py`:
+  - `_process_pdf_progressive()` — OCR 前调用 `embedder.unload()`，OCR 后调用 `embedder.reload()`
+  - 释放 ~2GB 显存给 PaddleOCR 使用
+- **修改** `src/ingestion/embedder.py`:
+  - 新增 `unload()` — `del self.model` → `gc.collect()` → `torch.cuda.empty_cache()`
+  - 新增 `reload()` — 重新调用 `_ensure_loaded()` 加载 BGE-M3
+
+### 降低 OCR 并行度 + 临时目录改 E 盘 + stderr 编码修复
+
+- **修改** `config.yaml`:
+  - `ocr.ocr_tmp_dir` 从 C 盘改为 `E:/RongNengRAG/data/ocr_tmp` — 避开系统盘
+  - `ocr.gpu_memory.max_wait_s` 从 600 降至 300
+- **修复** OCR 子进程 stderr 读取出错时 GBK 编码异常
+- **效果**: 磁盘 I/O 不再与系统盘争抢，显存等待超时更合理
+
+---
+
+## 2026-06-12
+
+### 检索评估框架建立
+
+- **新增** `eval/` 目录 — 三层检索评估体系:
+  - `README.md` — 评估框架说明和快速开始指南
+  - `datasets/` — 评估数据集 (JSON 格式，含 domain + category + relevant_chunks)
+  - `extract_dataset.py` — 从 `_test_results.json` 提取数据集
+  - `metrics.py` — 指标计算纯函数 (Recall@K, MRR, NDCG@10, Precision@K)
+  - `report_generator.py` — Markdown 报告生成器
+  - `run_eval.py` — 主评测入口
+  - `output/` — 评测报告和结构化数据输出
+- **三层评估**:
+  - Layer 1 (检索质量): Recall@K, MRR, NDCG@10, Precision@K
+  - Layer 2 (召回质量): 文档召回率, Chunk召回率, 跨文档覆盖率, Domain/Category准确率
+  - Layer 3 (重排序效果): Top-1提升率, MRR Delta, NDCG Delta, 退化检测
+- **首轮评测** (送电输电/标准规范, 30题):
+  - Recall@50: 0.833 | MRR: 0.406 | 关键词命中率: 55.5%
+  - 重排序 MRR 提升: +0.333 | NDCG 提升: +0.370
+
+### 答案质量对比评估
+
+- **新增** `eval/output/answer_comparison_*.md` — LLM 答案质量对比报告
+- 对比维度: 正确性、完整性、引用准确性、可读性
+
+---
+
 ## 2026-06-11
 
 ### GPU 显存感知调度 — OCR双槽并行 + 嵌入流水线 + Reranker按需卸载

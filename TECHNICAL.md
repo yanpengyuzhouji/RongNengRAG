@@ -1,5 +1,7 @@
 # 榕能电力审图知识库 RAG — 技术文档
 
+> 最后更新: 2026-06-22
+
 ## 1. 系统架构
 
 ### 1.1 整体架构
@@ -12,8 +14,8 @@
     ▼
 FastAPI (:8000)
     │
-    ├── FileProcessor ──→ Chunker + Embedder + MilvusStore
-    ├── Retriever     ──→ QueryAnalyzer + Embedder + MilvusStore + Reranker
+    ├── FileProcessor ──→ Chunker + Embedder + MilvusStore + OCREngine(子进程)
+    ├── Retriever     ──→ QueryAnalyzer + Embedder + MilvusStore + Reranker + FileRegistry
     ├── LLMEngine     ──→ Provider (Ollama/Bailian)
     │                      └── Ollama /api/chat (:11434)
     └── ConversationManager ──→ 多轮对话 + 上下文压缩
@@ -33,10 +35,16 @@ FastAPI (:8000)
 | 三阶段检索 (分析→召回→精排) | 兼顾召回率和准确率 |
 | 文件注册表识别 + 完整文档注入 | query 含文件名时注入完整文档，解决 chunk 检索遗漏问题 |
 | 同系列文件排除 | 匹配会议材料之一时排除 02-07，防止 LLM 混淆 |
-| PaddleOCR 扫描件识别 | 子进程隔离，自动检测文字量不足的页面并 OCR (GPU/CPU 可选) |
+| PaddleOCR 子进程隔离 | 独立 Python 环境 (PPOCRLabel venv)，protobuf 版本隔离，stdout/stderr 分离 |
 | GPU 显存感知调度 | 入库/搜索时按需加载模型，用完即卸，LLM 优先 |
-| OCR 双槽并行 + 嵌入流水线 | 2个OCR子进程 + 1个嵌入线程同时跑，时间减半 |
+| OCR 单子进程 communicate() 模式 | 根除 stderr 管道死锁，Popen+communicate 内置线程并发读取，无死锁风险 |
+| BGE-M3 OCR 前后卸载/重载 | 释放 ~2GB 显存给 PaddleOCR，防止两模型并存爆显存 |
+| 超大图自动缩放 | max_image_dim=3000，9744×6890 超大工程图从 660s 降至 2.6s/页 (254x) |
 | 三端一致性机制 | 注册表-向量库-物理文件 同步清理，失效文件自动检测 |
+| WeightedRanker 替代 RRFRanker | 让 dense_weight/sparse_weight 配置真正生效，不再被 RRF k=60 死代码忽略 |
+| jieba 分词域分类 | 替代 `if kw in query` 子串匹配，消除"配电装置"误判为配电域 |
+| 元数据加权加法归一化 | 替代乘法叠加(最高1.58x)，上限1.15x，防止元数据统治语义评分 |
+| 全文档注入上下文保护 | 超出10000字符自动截断，防止撑爆32768 token窗口导致LLM静默截断 |
 
 ## 2. 模块详解
 
@@ -63,6 +71,10 @@ result = embedder.encode(texts, show_progress=True)
 
 # 单查询嵌入
 dense_vec, sparse_vec = embedder.encode_query("变电消防要求")
+
+# 显存管理 (OCR 入库专用)
+embedder.unload()   # 释放 ~2GB 显存 → torch.cuda.empty_cache()
+embedder.reload()   # 重新加载 BGE-M3
 ```
 
 **模型**: `BAAI/bge-m3` (1024 维稠密 + 原生稀疏)，运行在 GPU (RTX 4070 SUPER) 上。
@@ -96,6 +108,11 @@ dense_vec, sparse_vec = embedder.encode_query("变电消防要求")
 - 集合自动创建: `_ensure_collection()` 在 insert 和 search 时自动调用
 - 集合自动加载: `load_collection()` 防止 `released` 状态
 
+**混合搜索** (2026-06-22 修复):
+- 使用 `WeightedRanker(dense_weight, sparse_weight)` 替代 `RRFRanker(k=60)`
+- `dense_weight` / `sparse_weight` 配置项对排名真正生效
+- 默认 dense=0.7, sparse=0.3 (标准规范语义更重要)
+
 ### 2.3 检索器 (`retrieval/retriever.py`)
 
 **类**: `Retriever` — 三阶段检索编排器
@@ -109,9 +126,13 @@ search(query, top_k, domain_filter)
     ├─ 阶段1: Embedder.encode_query() → MilvusStore.hybrid_search()
     │   RRF 融合稠密+稀疏搜索，返回 coarse_top_k=50 候选
     │
-    └─ 阶段2: Reranker.rerank(candidates, query, top_k)
-        嵌入相似度或交叉编码器评分 + 元数据加权
-        返回最终 top_k 结果
+    ├─ 阶段2: Reranker.rerank(candidates, query, top_k)
+    │   交叉编码器评分 + 元数据加权
+    │   返回最终 top_k 结果 → 自动调用 reranker.unload() 释放显存
+    │
+    └─ 阶段3: FileRegistry.detect_files_in_query(query)
+        检测到文件名 → 完整文档注入 + 同系列排除
+        完整文档超过 10000 字符自动截断 (防止撑爆 LLM 上下文窗口)
 ```
 
 **检索配置** (`config.yaml`):
@@ -120,9 +141,8 @@ search(query, top_k, domain_filter)
 retrieval:
   coarse_top_k: 50      # 粗召回候选数
   fine_top_k: 15         # 精排返回数
-  rrf_k: 60              # RRF 融合参数
-  dense_weight: 0.6      # 稠密向量权重
-  sparse_weight: 0.4     # 稀疏向量权重
+  dense_weight: 0.7      # 稠密向量权重 (WeightedRanker，语义更重要)
+  sparse_weight: 0.3     # 稀疏词法权重 (降低跨域关键词串扰)
 ```
 
 ### 2.4 查询分析器 (`retrieval/query_analyzer.py`)
@@ -131,11 +151,17 @@ retrieval:
 
 6 步分析管道:
 1. **文档编号提取**: 正则匹配 闽电/榕电/基建/运检 等发文编号
-2. **域分类**: 基于关键词典打分 (变电/配电/送电输电/综合)
+2. **域分类**: jieba 分词 + 词边界精确匹配 + 消歧规则 (变电/配电/送电输电/综合)
 3. **结构化参数提取**: 电压等级、专业类型、设备类型、发布层级、年份
 4. **查询类型判断**: 技术问答/文档查找/跨域对比/数值查规/通用
 5. **同义词扩展**: 电力领域同义词词典 (消防→防火/灭火, 接地→接地装置...)
 6. **Milvus 过滤表达式**: 构建标量过滤条件
+
+**域分类逻辑** (2026-06-22 修复):
+- 使用 jieba 分词后逐词精确匹配，避免 `if kw in query` 子串误判
+- "配电装置" 不再因含 "配电" 误判为配电域
+- 消歧规则: 变电/配电同时命中时，强变电信号("变电站""GIS""主变")加权+2
+- 消歧规则: 送电输电强信号("架空线路""杆塔""导线"等)加权+2
 
 ### 2.5 文件注册表 (`retrieval/file_registry.py`)
 
@@ -178,7 +204,7 @@ matches = registry.detect_files_in_query("会议材料一总结")
 entries = registry.search_by_filename("消防", exact=False)
 
 # 获取注册表摘要
-count = registry.get_file_count()  # → 32
+count = registry.get_file_count()  # → 42
 ```
 
 ### 2.6 重排序器 (`retrieval/reranker.py`)
@@ -197,36 +223,44 @@ count = registry.get_file_count()  # → 32
 - `unload()`: 搜索完成后释放 — `del self.model` + `torch.cuda.empty_cache()`，释放 ~2GB 显存
 - Retriever 在每次 `search()` 完成后自动调用 `unload()`，下次搜索按需重载
 
-**元数据加权** (两种模式通用):
-- 文件名匹配: ×1.30
-- 文档编号精确匹配: ×1.05
-- 标准规范类目: ×1.05
-- 国标/行标: ×1.05
-- 域精确匹配: ×1.05
-- 电压等级匹配: ×1.10
-- 图纸 (非查图查询): ×0.85
+**元数据加权** (两种模式通用，加法归一化 + 上限 1.15x):
+- 文件名匹配: +0.10
+- 文档编号精确匹配: +0.05
+- 标准规范类目: +0.03
+- 国标/行标: +0.03
+- 域精确匹配: +0.05
+- 电压等级匹配: +0.05
+- 图纸 (非查图查询): -0.10
+
+> 2026-06-22 修复: 从乘法叠加(最高1.58x)改为加法+上限1.15x，防止元数据统治语义评分。
+
+**上下文预算保护** (新增):
+- `build_context_with_file_injection()`: 完整文档超过 10000 字符自动截断
+- 防止全文档注入撑爆 Qwen3.5:4b 的 32768 token 上下文窗口
 
 **置信度校准**: 每个结果附带 `confidence` (0-1)，基于 rerank 分数 min-max 归一化。
 
 ### 2.7 GPU 显存监控 (`utils/gpu_monitor.py`)
 
-**`新增`** **类**: `GpuMonitor` — GPU 显存实时监控 + 背压调度
+**类**: `GpuMonitor` — GPU 显存实时监控 + 背压调度
 
 **功能**:
-- `get_vram_info()`: pynvml 实时查询 总/已用/空闲显存
+- `get_vram_info()`: pynvml 实时查询 总/已用/空闲显存，计算 `effective_free_mb` (WDDM 缓存可被 CUDA 回收复用)
 - `is_ollama_busy()`: 通过 `/api/ps` 检测 Ollama 是否有模型在推理
 - `wait_for_vram(min_free_mb)`: 背压等待 — 显存不足时检查 Ollama 状态，LLM 繁忙则轮询等待直至释放，LLM 空闲则短等 30s 后强制执行
+- `get_ocr_workers_possible(vram_per_worker_mb, safety_margin_mb)`: 基于有效空闲显存计算安全 OCR 并行数 (上限 3)
+- `log_vram_snapshot(tag)`: 打印 GPU + 系统 RAM 快照
 
 **显存预算 (RTX 4070 SUPER 12GB)**:
 ```
 BGE-M3 (常驻)        ~2.0 GB    每次查询都要做 embedding
 BGE-Reranker (按需)   ~2.0 GB    搜索时加载，用完释放
-PaddleOCR (按需)      ~2.5 GB    入库时加载，子进程退出释放
+PaddleOCR (按需)      ~2.5 GB    入库时子进程加载，退出释放
 Ollama LLM (独立)     ~4.0 GB    独立进程，不占 Python 显存
-系统 + 桌面           ~1.5 GB    Windows + VS Code + Edge
+系统 + 桌面           ~1.7 GB    Windows + VS Code + Edge
 ────────────────────────────────
-峰值并行               ~8.0 GB    12GB 容量内有 33% 裕量
-常态                   ~3.8 GB    仅 BGE-M3 + 系统
+峰值并行               ~8.0 GB   12GB 容量内有 33% 裕量
+常态                   ~3.8 GB   仅 BGE-M3 + 系统
 ```
 
 **调度策略**:
@@ -235,8 +269,8 @@ Ollama LLM (独立)     ~4.0 GB    独立进程，不占 Python 显存
 | 空闲 | ✅ 常驻 | — | — | 3.8 GB |
 | 用户提问 | ✅ | ✅ 临时加载 | — | 5.8 GB → 用完释放 |
 | 入库纯文字 | ✅ | — | — | 3.8 GB |
-| 入库含扫描页 | ✅ | — | ✅ 2进程 | 8 GB → 子进程退出释放 |
-| 提问+入库同时 | ✅ | ✅ | ✅ 1进程 | 7-8 GB ✓ |
+| 入库含扫描页 | 先卸后载 | — | ✅ 单子进程 | 卸后~2G空闲→OCR~4.2G→重载~6.2G |
+| 提问+入库同时 | ✅ | ✅ | ✅ 单子进程 | backpressure 排队 |
 
 ### 2.8 OCR 引擎 (`ingestion/ocr_engine.py`)
 
@@ -250,9 +284,9 @@ Ollama LLM (独立)     ~4.0 GB    独立进程，不占 Python 显存
     │
     │  _get_ocr_python() → PPOCRLabel .venv python
     │  _get_ocr_env()    → PYTHONPATH="" + PROTOCOL_BUFFERS=python
-    │  subprocess.run()
+    │  subprocess.Popen() + communicate(input=json, timeout=N)
     ▼
-OCR 子进程
+OCR 子进程 (PPOCRLabel venv, paddlepaddle-gpu 3.2.2)
     │  sys.stdout → stderr (模型加载日志)
     │  _orig_stdout_fd → 干净 JSON 通道
     │
@@ -261,12 +295,16 @@ OCR 子进程
     └─ PaddleOCR(lang="ch", use_textline_orientation=True, device="gpu")
 ```
 
-**stdout/stderr 分离机制**:
+**stdout/stderr 分离机制** (根因修复):
 - CLI 入口 `__main__` 将 `sys.stdout` 重定向到 `sys.stderr`
 - 保存 `_orig_stdout_fd = os.fdopen(os.dup(1))` 作为原始 stdout
 - PaddleOCR 初始化日志（ANSI 彩色输出、模型加载信息）→ stderr
 - `_stdout_json()` 通过 `_orig_stdout_fd` 输出 JSON → 主进程 `capture_output` 拿到干净数据
-- `_parse_json_stdout()` 兼容处理: 从多行混合输出中提取 JSON（从后往前找 `{` 行）
+- **根因修复**: 使用 `subprocess.Popen` + `proc.communicate()` 替代 `--stream` 管道模式
+  - `communicate()` 内部用线程并发读取 stdout/stderr，**无死锁风险**
+  - 原方案 stderr=PIPE 时 PaddleOCR 日志写满 64KB OS 管道缓冲区导致死锁
+  - 死锁导致 WDDM 无法回收 CUDA context，显存从 2GB 泄漏到 12GB
+  - 超时后 `cmd //c taskkill /F /T /PID` 杀整个进程树 (含 PaddlePaddle CUDA 孙进程)
 
 **PaddleOCR 2.x/3.x 兼容**:
 ```python
@@ -281,14 +319,33 @@ elif isinstance(r0, list):
         ...
 ```
 
-**批量子进程模式** (`--batch`):
+**单子进程批量模式** (`--batch`):
 - 主进程将图片路径列表通过 stdin JSON 传给子进程
 - 子进程一次性加载模型，批量处理所有图片
-- DPI 150: GPU ~5-7s/页 (PP-OCRv5_server)
+- DPI 150, GPU: ~5-7s/页 (PP-OCRv5_server)
+- **单子进程设计**: 通过 `_ocr_lock` 全局互斥锁保证同时最多 1 个 OCR 子进程
+  - 防止 2+ PaddleOCR 实例同时占用 GPU 导致 OOM
+
+**超大图自动缩放**:
+- `max_image_dim=3000`: PDF 渲染 PNG 后，若边长超限则用 Pillow LANCZOS 缩放
+- 大规格工程图 (65"×46") 150DPI = 9744×6890px
+- 直接 OCR: 660s/页 + 12GB 显存
+- 缩放至 3000px: 2.6s/页 + ~10GB 显存 (254x 提速)
 
 **大文件分批 + 动态超时**:
 - 每批 ≤50 页，避免单次子进程超时和显存溢出
 - 超时 = `max(300, chunk_pages × 15s)`，按页数自动伸缩
+
+**OCR 阶段的显存编排流程**:
+```
+阶段                     显存分布                        空闲
+─────────────────────────────────────────────────────────────
+空闲态:   BGE-M3(2G) + WDDM(1.7G) = 3.7G             ~8.3G
+OCR准备:  卸载BGE→torch.cuda.empty_cache()            ~10.3G
+OCR运行:  WDDM(1.7G) + PaddleOCR(2.5G) = ~4.2G        ~7.8G
+OCR完成:  子进程退出→WDDM回收                          ~10.3G
+重载BGE:  BGE-M3(2G) + WDDM(1.7G) = 3.7G             ~8.3G
+```
 
 **API**:
 ```python
@@ -303,7 +360,7 @@ result = engine.ocr_pdf_pages("/path/to/doc.pdf", pages=[0..137])
 
 ### 2.9 文件处理器 (`ingestion/file_processor.py`)
 
-**类**: `FileProcessor` — 完整入库管道 + 双槽并行调度
+**类**: `FileProcessor` — 完整入库管道 + 显存编排
 
 ```
 process(file_path, domain, category)
@@ -313,12 +370,10 @@ process(file_path, domain, category)
     ├─ [PDF + OCR 启用] _process_pdf_progressive()
     │   │
     │   ├─ PDFParser.parse() → 检测 needs_ocr_pages
-    │   ├─ ThreadPoolExecutor(2) → 2个OCR子进程并行
-    │   │   Worker1: ocr_pages(batch1) ─┐
-    │   │   Worker2: ocr_pages(batch2) ─┤ 同时跑!
-    │   │                                │
-    │   ├─ queue.Queue ← 分块完成入队 ←┘
-    │   └─ Thread: 嵌入+insert (与OCR并行消费队列)
+    │   ├─ ★ 卸载 BGE-M3 → embedder.unload()
+    │   ├─ OCREngine.ocr_pdf_pages() → 单子进程批量 OCR
+    │   ├─ ★ 重载 BGE-M3 → embedder.reload()
+    │   └─ OCR 文本分块 → Chunker
     │
     └─ [通用路径] _parse_file() → _embed_and_insert()
         │
@@ -328,6 +383,7 @@ process(file_path, domain, category)
         │   ├─ DOCX: python-docx (段落+表格) → Chunker
         │   ├─ WPS: 6级回退: docx→zip→LibreOffice→olefile→WPS COM→Word COM
         │   ├─ XLSX: openpyxl → Chunker
+        │   ├─ OFD: ofd_extractor → ofdparser fallback → Chunker
         │   └─ TXT/MD: 直接读取 → Chunker
         │
         ├─ Step 2: 嵌入
@@ -337,11 +393,12 @@ process(file_path, domain, category)
             MilvusStore.insert(chunks, dense_vecs, sparse_vecs)
 ```
 
-**双槽并行效果**:
+**显存编排效果** (OCR 入库):
 ```
-138页全扫描 (10批, 每批15页):
-  串行: 10×75s + 嵌入56s = 806s
-  双槽: 5×75s + 嵌入56s(与OCR并行) ≈ 430s  快 47%
+138页全扫描:
+  旧方案 (两模型并存): BGE-M3(2G)+PaddleOCR(2.5G)=4.5G → 常驻
+  新方案 (卸载重载): OCR期间仅 PaddleOCR(2.5G)，完成后重载 BGE-M3
+  节省: 2GB 显存裕量，防止 OOM
 ```
 
 **docx 表格提取**:
@@ -359,7 +416,29 @@ for table in doc.tables:
 - `sync_orphans()`: 扫描物理文件已消失的记录 → 清理向量+标记 deleted
 - 异常中断恢复: `delete_by_file_hash(file_hash)` 清理已插入 chunk
 
-### 2.10 LLM 推理引擎 (`generation/llm_engine.py`)
+### 2.10 OFD 文档提取器 (`ingestion/ofd_extractor.py`)
+
+**新增** 国产版式文档 GB/T 33190 文本提取器。
+
+**设计策略**: 优先使用自定义标准库提取器 (零依赖)，ofdparser 作为回退。
+
+**核心功能**:
+- **直接 Unicode 文本提取**: 解析 OFD XML 中的 TextCode，直接读取 Unicode 文本
+- **GBK/GB18030 编码处理**: 自动检测并解码常见于中文 OFD 的 GBK 编码 TextCode
+- **CMap 字形映射**: 处理 CID-keyed 字体的字形 ID → Unicode 映射
+- **多页支持**: 按页遍历，合并每页文本层
+
+**回退链**: 自定义提取器 → ofdparser (需 reportlab, xmltodict)
+
+**API**:
+```python
+from ingestion.ofd_extractor import extract_ofd_text
+
+text = extract_ofd_text("/path/to/document.ofd")
+# → 按页合并的纯文本
+```
+
+### 2.11 LLM 推理引擎 (`generation/llm_engine.py`)
 
 **类**: `LLMEngine` — Provider 模式 facade
 
@@ -386,7 +465,7 @@ LLMEngine (facade)
 - `general_qa`: 通用问答
 - `SYSTEM_PROMPT_CHAT`: 多轮对话系统提示 (直接回答，不输出思考过程)
 
-### 2.11 对话管理 (`generation/conversation_manager.py`)
+### 2.12 对话管理 (`generation/conversation_manager.py`)
 
 **类**: `ConversationManager`
 
@@ -395,7 +474,7 @@ LLMEngine (facade)
 - 保留最近 `keep_detail_rounds=3` 轮完整内容
 - 所有时间戳使用北京时间 `Asia/Shanghai`
 
-### 2.12 Gradio UI (`ui/app.py`)
+### 2.13 Gradio UI (`ui/app.py`)
 
 **v3.0 重构** — 聊天界面 + 会话管理:
 
@@ -418,7 +497,8 @@ LLMEngine (facade)
 - **会话隔离**: `gr.State` 维护 `conversation_id`，每会话独立上下文
 - **心跳动画**: 检索/thinking 阶段显示 "🔍 检索中..." / "💭 思考中..."
 - **会话管理**: 新建/切换/删除，API CRUD
-- **文件管理**: 保留原 Tab（入库/检索/统计）
+- **文件管理**: 保留原 Tab（入库/检索/统计），含三端一致性校验
+- **失效文件检测**: 自动检测物理文件存在性，标记 `[~] 文件丢失`
 
 ## 3. API 接口文档
 
@@ -480,7 +560,8 @@ LLMEngine (facade)
       "doc_number": "GB 50060-2008",
       "voltage_level": "220kV",
       "publish_level": "国标",
-      "page_num": 15
+      "page_num": 15,
+      "confidence": 0.87
     }
   ]
 }
@@ -534,7 +615,7 @@ data: {"token":"","done":true,"citations":[...],"full_answer":"..."}  // 完成
 
 ### GET /gpu
 
-GPU 显存状态（`新增`）:
+GPU 显存状态:
 
 ```json
 {
@@ -548,7 +629,7 @@ GPU 显存状态（`新增`）:
 
 ### POST /files/sync
 
-一致性校验（`新增`）:
+一致性校验:
 
 ```
 POST /files/sync?dry_run=false  → 执行清理
@@ -579,9 +660,11 @@ FileProcessor.process(file_path)
     ├─ 检查 file_metadata.db → 已入库? → 跳过
     ├─ _build_file_meta() → 元数据 (域/类目/编号/电压/设备...)
     ├─ _parse_file()
-    │   ├─ PDF → PDFParser.parse() → 逐页文本
-    │   ├─ DOCX → python-docx → 段落文本
+    │   ├─ PDF → PDFParser.parse() → 两阶段采样 → 逐页文本
+    │   ├─ PDF+OCR → 卸载BGE-M3 → OCR子进程 → 重载BGE-M3
+    │   ├─ DOCX → python-docx → 段落+表格文本
     │   ├─ XLSX → openpyxl → 表格文本
+    │   ├─ OFD → ofd_extractor → ofdparser回退
     │   └─ Chunker → 语义分块 / 单页分块 / 全文分块
     │
     ├─ Embedder.encode(texts) → 稠密向量 + 稀疏向量
@@ -607,18 +690,17 @@ Retriever.search(query, top_k)
     │   └─ 同义词扩展 "消防" → "防火/灭火/火灾报警"
     │
     ├─ Embedder.encode_query(expanded_query)
-    │   └─ Ollama /api/embeddings → [1024 维向量]
+    │   └─ BGE-M3 → [1024 维稠密向量] + [稀疏向量]
     │
     ├─ MilvusStore.hybrid_search(dense_vec, sparse_vec, filter_expr)
     │   ├─ 稠密搜索 (COSINE) → dense_req
     │   ├─ 稀疏搜索 (IP)    → sparse_req
-    │   └─ RRF 融合 → 50 candidates
+    │   └─ WeightedRanker(dense_weight, sparse_weight) 融合 → 50 candidates
     │
     ├─ Reranker.rerank(query, candidates, top_k)
-    │   ├─ Ollama 嵌入检索 query + 候选文本
-    │   ├─ 余弦相似度计算
+    │   ├─ BGE-Reranker-v2-m3 交叉编码器评分
     │   ├─ 元数据加权
-    │   └─ 排序取 Top-K
+    │   └─ 排序取 Top-K → 自动 unload()
     │
     └─ 返回 SearchResponse {results, query_type, domain, elapsed_ms}
 ```
@@ -633,7 +715,7 @@ Retriever.search(query, top_k)
     │
     ├─ Retriever.search() → 检索结果
     │
-    ├─ [新增] FileRegistry.detect_files_in_query(query)
+    ├─ FileRegistry.detect_files_in_query(query)
     │   └─ 四策略匹配 → FileMatchResult? (文件名 + score + 系列标识)
     │
     ├─ 分支判断:
@@ -665,21 +747,81 @@ Retriever.search(query, top_k)
 - 同系列文件**100% 排除**: 匹配材料01 → 自动过滤02-07
 - 补充检索从 5+ 个缩减至**最多 2 个**，且标注不可引用
 - 检索无结果时仍尝试从注册表拉取: 纯文件名查询也能拿到答案
+- **上下文预算保护**: 完整文档超过 10000 字符自动截断，防止撑爆 LLM 32768 token 窗口
 
-## 5. 部署配置
+## 5. 评估框架
 
-### 5.1 配置文件
+### 5.1 三层评估体系
+
+```
+问题 → domain_filter → 混合检索 → 快照候选池(L1) → Reranker → Top-N(L3)
+                                  ↓
+                              召回质量(L2)
+```
+
+| 层级 | 评估目标 | 核心指标 |
+|------|----------|----------|
+| L1 检索质量 | 混合检索候选池 (50条) 的覆盖力和排序质量 | Recall@K, MRR, NDCG@10, Precision@K, Hit Rate |
+| L2 召回质量 | 系统从知识库中找回所有相关材料的能力 | 文档召回率, Chunk召回率, 跨文档覆盖率, Domain/Category准确率 |
+| L3 重排序效果 | Reranker 对排序的改善程度 | Top-1提升率, MRR Delta, NDCG Delta, 退化检测 |
+
+### 5.2 数据集格式
+
+```json
+{
+  "dataset_name": "域/类目 检索评估数据集",
+  "domain": "送电输电",
+  "category": "标准规范",
+  "version": "1.0",
+  "total_questions": 30,
+  "questions": [
+    {
+      "id": 1,
+      "question": "66kV及以下架空电力线路杆塔...？",
+      "domain_filter": "送电输电",
+      "category": "架空输电线路",
+      "source_doc": "GB_50061-2010_...",
+      "expected_keywords": ["荷载设计值", "极限状态"],
+      "relevant_chunks": [],
+      "expected_top1_doc": "GB_50061-2010_...2025年版.pdf"
+    }
+  ]
+}
+```
+
+### 5.3 评测结果摘要 (2026-06-14)
+
+| 指标 | 数值 |
+|------|------|
+| Recall@50 | 0.833 |
+| MRR | 0.406 |
+| NDCG@10 | 0.248 |
+| 文档召回率 | 0.467 |
+| 关键词命中率 | 55.5% |
+| MRR Delta (重排) | +0.333 |
+| NDCG Delta (重排) | +0.370 |
+
+> 完整报告见 `eval/output/eval_report_*.md`
+
+## 6. 部署配置
+
+### 6.1 配置文件
 
 `config.yaml` 位于项目根目录，所有路径相对解析。关键配置节：
 
 ```yaml
 ocr:
-  use_gpu: true              # GPU 推理 (~5s/页 vs CPU ~15s/页)
+  enabled: true
+  use_gpu: true              # GPU 推理 (~5-7s/页 vs CPU ~15-18s/页)
   dpi: 150
+  max_image_dim: 3000        # 超大图自动缩放 (9744×6890→3000px, 254x 提速)
   gpu_memory:
     min_free_vram_mb: 2500   # 入库所需最小空闲显存
     poll_interval_s: 5       # 显存轮询间隔
-    max_wait_s: 600          # 最大等待时间
+    max_wait_s: 300          # 最大等待时间
+  turbo:
+    enabled: false           # VRAM感知多子进程并行 (大文件可选)
+    max_workers: 0           # 0=自动(基于VRAM), 1=单进程(safe)
 
 embedding:
   provider: "sentence_transformers"
@@ -692,16 +834,16 @@ reranker:
   device: "cuda"
 ```
 
-### 5.2 模型运行位置
+### 6.2 模型运行位置
 
 | 模型 | 运行位置 | 加载策略 | 显存 |
 |------|----------|----------|------|
-| BAAI/bge-m3 | GPU (sentence_transformers) | 常驻 | ~2.0 GB |
+| BAAI/bge-m3 | GPU (sentence_transformers) | 常驻，OCR 前卸载/后重载 | ~2.0 GB |
 | BAAI/bge-reranker-v2-m3 | GPU (FlagEmbedding) | 按需加载/卸载 | ~2.0 GB |
-| PaddleOCR PP-OCRv5_server | GPU (PPOCRLabel venv) | 入库时子进程加载，退出释放 | ~2.5 GB |
-| qwen3.5:4b | GPU (Ollama) | 独立进程 | ~4.0 GB |
+| PaddleOCR PP-OCRv5_server | GPU (PPOCRLabel venv 子进程) | 入库时单子进程加载，退出释放 | ~2.5 GB |
+| qwen3.5:4b | GPU (Ollama 独立进程) | Ollama 管理，OCR 时可通知卸载 | ~4.0 GB |
 
-### 5.3 数据存储
+### 6.3 数据存储
 
 | 路径 | 内容 |
 |------|------|
@@ -709,11 +851,12 @@ reranker:
 | `data/file_metadata.db` | SQLite 文件注册表 |
 | `data/uploads/` | 上传文件暂存 |
 | `data/parsed_cache/` | 解析缓存 |
+| `data/ocr_tmp/` | OCR 临时 PNG (E 盘，避开系统盘) |
 | `config.yaml` | 运行时配置 |
 | `.env` | API Key (不入 git) |
 | `.env.example` | API Key 模板 |
 
-## 6. 性能参数
+## 7. 性能参数
 
 | 参数 | 值 |
 |------|-----|
@@ -722,9 +865,11 @@ reranker:
 | 检索耗时 | ~3-4s (QueryAnalyze+HybridSearch+Reranker加载+Rerank) |
 | LLM token/s | ~112 t/s (qwen3.5:4b, think=false) |
 | 问答总耗时 | ~8-15s (搜索4s + LLM生成5-12s) |
-| OCR 扫描页 | ~5-7s/页 (GPU, PP-OCRv5_server) |
-| 138页全扫描件 | ~7-8 分钟 (双槽并行) |
+| OCR 扫描页 | ~5-7s/页 (GPU, PP-OCRv5_server, dpi=150) |
+| 超大图 OCR (缩放后) | ~2.6s/页 (max_image_dim=3000, LANCZOS) |
+| 138页全扫描件 | ~7-8 分钟 (单子进程批量) |
 | 粗召回候选数 | 50 |
 | 精排结果数 | 15 (可配置) |
 | GPU | NVIDIA RTX 4070 SUPER (12GB) |
-| 空闲显存 | ~8.4 GB (常态仅 BGE-M3 + 系统) |
+| 空闲显存 | ~8.3 GB (常态仅 BGE-M3 + 系统) |
+| OCR 期间空闲显存 | ~7.8 GB (BGE-M3 卸载后) |

@@ -465,6 +465,19 @@ class Retriever:
         print(f"[file-registry] 完整文档已注入: {len(full_doc)} 字符, "
               f"源文件: {file_match.entry.file_name}")
 
+        # 上下文预算检查: 完整文档超长时截断，防止撑爆 LLM 窗口
+        # Qwen3.5:4b num_ctx=32768, 中文字符≈0.5 token → 安全上限10000 chars (约5000 tokens)
+        # 留出 prompt template (~500) + generation budget (4096) = 足够的空间
+        MAX_FULL_DOC_CHARS = 10000
+        if len(full_doc) > MAX_FULL_DOC_CHARS:
+            orig_len = len(full_doc)
+            full_doc = full_doc[:MAX_FULL_DOC_CHARS] + (
+                f"\n\n【注意：完整文档过长（{orig_len}字符），已截断至{MAX_FULL_DOC_CHARS}字符。"
+                f"此处仅展示前半部分，如需后续内容请具体提问。】"
+            )
+            print(f"[file-registry] WARN: 完整文档过长 ({orig_len} 字符), "
+                  f"截断至 {MAX_FULL_DOC_CHARS} 字符")
+
         # 构建注入式上下文: 完整文档 + 聚焦指令 + 检索补充
         context_parts = []
 

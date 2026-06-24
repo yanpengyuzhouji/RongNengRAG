@@ -6,7 +6,7 @@ Milvus Lite 向量数据库 — Schema 创建 + 批量入库
 import os
 import time
 from pymilvus import (
-    MilvusClient, DataType, Function, AnnSearchRequest, RRFRanker
+    MilvusClient, DataType, Function, AnnSearchRequest, RRFRanker, WeightedRanker
 )
 from typing import List, Dict, Optional
 
@@ -271,11 +271,15 @@ class MilvusStore:
             limit=limit * 2,
         )
 
-        # RRF 混合搜索 (pymilvus 3.0: ranker 而非 rerank)
+        # 加权融合搜索 (dense_weight + sparse_weight = 1.0)
+        # 使用 WeightedRanker 替代 RRFRanker，让 config.yaml 中的
+        # dense_weight/sparse_weight 配置真正生效
+        ranker = WeightedRanker(dense_weight, sparse_weight)
+
         results = self.client.hybrid_search(
             collection_name=self.COLLECTION_NAME,
             reqs=[dense_req, sparse_req],
-            ranker=RRFRanker(k=rrf_k),
+            ranker=ranker,
             filter=filter_expr,
             limit=limit,
             output_fields=output_fields,

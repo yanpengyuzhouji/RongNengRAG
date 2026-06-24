@@ -230,22 +230,20 @@ class Reranker:
         return result
 
     def _compute_metadata_boost(self, query: str, candidate: dict, analyzed_query) -> float:
-        """计算元数据加权系数（降低过度加权风险）"""
-        boost = 1.0
+        """计算元数据加权系数（加法归一化，上限1.15，防止元数据统治语义评分）"""
+        boost_delta = 0.0
         entity = candidate.get("entity", candidate)
 
         # 文档编号精确匹配
         doc_number = entity.get("doc_number", "")
         if doc_number and doc_number in query:
-            boost *= self.metadata_boosts.get("exact_doc_number_match", 1.05)
+            boost_delta += 0.05
 
-        # 文件名匹配 (新增)
+        # 文件名匹配
         file_name = entity.get("file_path", "")
         if file_name:
             fname = os.path.basename(file_name).lower()
-            # 检查查询中是否包含文件名片段
             query_lower = query.lower()
-            # 用文件名中的中文/英文/数字片段匹配
             import re
             fname_tokens = re.split(r'[_\-\.\s]+', fname)
             matched = 0
@@ -253,34 +251,35 @@ class Reranker:
                 if len(token) >= 2 and token.lower() in query_lower:
                     matched += 1
             if matched >= 2:
-                boost *= self.metadata_boosts.get("file_name_match", 1.30)
+                boost_delta += 0.10  # 从乘法1.30降为加法0.10，防止文件名匹配统治排名
 
         # 标准规范类目
         category = entity.get("category", "")
         if category == "标准规范":
-            boost *= self.metadata_boosts.get("category_standard", 1.05)
+            boost_delta += 0.03
 
         # 国标/行标
         publish_level = entity.get("publish_level", "")
         if publish_level in ("国标", "行标"):
-            boost *= self.metadata_boosts.get("publish_level_national", 1.05)
+            boost_delta += 0.03
 
         # 图纸降权
         is_drawing = entity.get("is_drawing", False)
         if is_drawing and not self._is_drawing_query(query):
-            boost *= 0.85
+            boost_delta -= 0.10
 
         # 域匹配
         if analyzed_query and analyzed_query.domain:
             if entity.get("domain", "") == analyzed_query.domain:
-                boost *= 1.05
+                boost_delta += 0.05
 
         # 电压等级匹配
         if analyzed_query and analyzed_query.voltage_level:
             if entity.get("voltage_level", "") == analyzed_query.voltage_level:
-                boost *= 1.10
+                boost_delta += 0.05
 
-        return boost
+        # 加法上限 1.15 (最多提升15%)
+        return min(1.15, 1.0 + boost_delta)
 
     def _is_drawing_query(self, query: str) -> bool:
         drawing_kw = ["图纸", "方案图", "布置图", "接线图", "主接线",
