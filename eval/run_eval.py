@@ -131,8 +131,11 @@ def http_post(url: str, data: dict, timeout: int = 120) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    # 绕过 Windows 系统代理，直连 localhost
+    proxy_handler = urllib.request.ProxyHandler({})
+    opener = urllib.request.build_opener(proxy_handler)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as e:
         raise ConnectionError(f"无法连接 API: {e}\n请确认 python src/api/main.py 已启动") from e
@@ -142,7 +145,9 @@ def check_api_health(api_url: str) -> bool:
     """检查 API 是否在线."""
     try:
         req = urllib.request.Request(f"{api_url}/health", method="GET")
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        proxy_handler = urllib.request.ProxyHandler({})
+        opener = urllib.request.build_opener(proxy_handler)
+        with opener.open(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return data.get("status") == "ok"
     except Exception:
