@@ -15,6 +15,16 @@ FastAPI 后端服务 — 榕能电力审图知识库 RAG API
 
 import sys
 import os
+
+# 强制离线模式 — BGE-M3 已缓存至 E:/huggingface_cache，禁止联网验证
+# (Windows 系统代理会拦截所有 HTTP 请求，代理客户端未启动时导致加载失败)
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# 绕过 Windows 系统代理 (127.0.0.1:7890)
+os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1,0.0.0.0,.local"
+os.environ["no_proxy"] = "localhost,127.0.0.1,::1,0.0.0.0,.local"
+
 import json
 import re
 import time
@@ -454,6 +464,14 @@ async def add_files_from_paths(
 
 # ===== 文件管理端点 =====
 
+@app.get("/files/summary", response_model=SummaryResponse)
+async def get_files_summary():
+    """入库文件统计摘要 (必须在 /files/{identifier} 之前注册以避免路径冲突)"""
+    processor = get_processor()
+    s = processor.get_summary()
+    return SummaryResponse(**s)
+
+
 @app.get("/files/{identifier}")
 async def get_file_detail(identifier: str):
     """获取单个文件详情 (按 hash 或文件名查找)"""
@@ -618,14 +636,6 @@ async def list_files(
     files = processor.list_files(status=status, domain=domain, limit=limit, offset=offset)
     missing_count = sum(1 for f in files if f.get("file_exists") is False)
     return {"count": len(files), "files": files, "missing_count": missing_count}
-
-
-@app.get("/files/summary", response_model=SummaryResponse)
-async def get_files_summary():
-    """入库文件统计摘要"""
-    processor = get_processor()
-    s = processor.get_summary()
-    return SummaryResponse(**s)
 
 
 # ===== 检索与问答端点 =====
