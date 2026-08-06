@@ -1,0 +1,41 @@
+# ===== Core RAG Framework =====
+pymilvus>=2.4.0          # Milvus Lite vector database (hybrid search)
+
+# ===== Embedding & Reranking =====
+sentence-transformers>=3.0.0  # BGE-M3 + BGE-Reranker
+FlagEmbedding>=1.3.0          # BAAI embedding models (BGE-M3, BGE-Reranker)
+# torch — 按 CUDA/CPU 需求单独安装 (见部署指南)
+
+# ===== Document Parsing =====
+PyMuPDF>=1.24.0           # PDF 文本提取 + 页面渲染 (fitz)
+python-docx>=1.1.0        # DOCX parsing
+python-pptx>=1.0.0        # PPTX parsing
+openpyxl>=3.1.0           # XLSX parsing
+xlrd>=2.0.1               # XLS parsing
+xmltodict>=0.13.0         # XML 解析
+reportlab>=4.0.0          # 文档渲染
+Pillow>=10.0.0            # 图片处理 (OCR 页面缩放)
+
+# ===== Archive Handling =====
+rarfile>=4.1              # RAR archive extraction
+
+# ===== LLM Inference (OpenAI 兼容接口) =====
+openai>=1.0.0             # 调用任意 OpenAI 兼容服务 (vLLM/Xinference/PaddleX serving)
+
+# ===== API & UI =====
+fastapi>=0.115.0          # REST API
+uvicorn[standard]>=0.30.0 # ASGI server
+pydantic>=2.0.0           # Data validation
+
+# ===== Utilities =====
+pyyaml>=6.0               # Configuration
+python-dotenv>=1.0.0      # .env 环境变量
+rich>=13.0.0              # Console output formatting
+tqdm>=4.66.0              # Progress bars
+python-multipart>=0.0.9   # File upload support
+
+# ===== Database =====
+# SQLite is built into Python stdlib
+
+# ===== 可选: GPU 监控 (无 GPU 环境可跳过) =====
+# nvidia-ml-py>=12.0.0

@@ -1,0 +1,306 @@
+"""
+GPU 显存监控器 — 入库背压控制 (本地仅运行嵌入/重排模型)
+
+功能:
+  1. 实时检测 GPU 显存使用情况 (pynvml)
+  2. 入库前等待显存释放
+  3. 可配置的阈值和轮询间隔
+"""
+
+import time
+import logging
+from typing import Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+class GpuMonitor:
+    """
+    GPU 显存监控器
+
+    用法:
+        monitor = GpuMonitor()
+        if monitor.wait_for_vram(min_free_mb=3000):
+            # 显存充足，可以入库
+            ...
+    """
+
+    def __init__(self,
+                 min_free_vram_mb: int = 3000,
+                 poll_interval_s: float = 5.0,
+                 max_wait_s: float = 600.0):
+        """
+        Args:
+            min_free_vram_mb: 入库所需的最小空闲显存 (MB)
+                             默认为 3000MB — 供本地嵌入/重排模型使用
+            poll_interval_s: 轮询间隔 (秒)
+            max_wait_s: 最大等待时间 (秒)，超时后强制执行
+        """
+        self.min_free_vram_mb = min_free_vram_mb
+        self.poll_interval_s = poll_interval_s
+        self.max_wait_s = max_wait_s
+        self._nvml_available = False
+
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._nvml = pynvml
+            self._nvml_available = True
+            self._device_count = pynvml.nvmlDeviceGetCount()
+            logger.info(f"GPU 监控就绪: {self._device_count} 个设备 (pynvml)")
+        except Exception as e:
+            logger.warning(f"pynvml 不可用，回退到 torch.cuda: {e}")
+            self._init_torch_fallback()
+
+    def _init_torch_fallback(self):
+        """回退到 torch.cuda 监控 (仅报告 PyTorch 显存)"""
+        try:
+            import torch
+            self._torch = torch
+            self._torch_available = torch.cuda.is_available()
+            if self._torch_available:
+                logger.info("GPU 监控就绪: torch.cuda (回退模式，仅限 PyTorch)")
+            else:
+                logger.warning("GPU 监控不可用: 无 CUDA 设备")
+        except ImportError:
+            self._torch_available = False
+            logger.warning("GPU 监控不可用: torch 未安装")
+
+    def get_vram_info(self) -> dict:
+        """
+        获取 GPU 显存信息
+
+        Returns:
+            {total_mb, used_mb, free_mb, effective_free_mb, device_index}
+            effective_free_mb = nvidia-smi free + WDDM 可回收缓存
+        """
+        if self._nvml_available:
+            try:
+                handle = self._nvml.nvmlDeviceGetHandleByIndex(0)
+                info = self._nvml.nvmlDeviceGetMemoryInfo(handle)
+                total_mb = info.total // (1024 * 1024)
+                used_mb = info.used // (1024 * 1024)
+                free_mb = info.free // (1024 * 1024)
+
+                # WDDM 驱动缓存: nvidia-smi used 中不归 torch 管的部分可被复用
+                torch_reserved = 0
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch_reserved = torch.cuda.memory_reserved(0) // (1024 * 1024)
+                except Exception:
+                    pass
+
+                # 系统桌面渲染预留 ~1700MB
+                system_overhead = 1700
+                # WDDM 缓存 = nvml.used - torch_reserved - 系统开销
+                wddm_cache = max(0, used_mb - torch_reserved - system_overhead)
+                effective_free_mb = free_mb + wddm_cache
+
+                return {
+                    "total_mb": total_mb,
+                    "used_mb": used_mb,
+                    "free_mb": free_mb,
+                    "effective_free_mb": effective_free_mb,
+                    "torch_reserved_mb": torch_reserved,
+                    "wddm_cached_mb": wddm_cache,
+                    "device_index": 0,
+                }
+            except Exception:
+                pass
+
+        if getattr(self, "_torch_available", False):
+            try:
+                total = self._torch.cuda.get_device_properties(0).total_memory
+                reserved = self._torch.cuda.memory_reserved(0)
+                allocated = self._torch.cuda.memory_allocated(0)
+                total_mb = total // (1024 * 1024)
+                used_mb = reserved // (1024 * 1024)
+                free_mb = (total - reserved) // (1024 * 1024)
+                return {
+                    "total_mb": total_mb,
+                    "used_mb": used_mb,
+                    "free_mb": free_mb,
+                    "device_index": 0,
+                    "note": "torch.cuda only — 不含其他进程",
+                }
+            except Exception:
+                pass
+
+        return {"total_mb": 0, "used_mb": 0, "free_mb": 0, "device_index": -1}
+
+    def get_free_vram_mb(self) -> int:
+        """返回当前空闲显存 (MB)"""
+        return self.get_vram_info().get("effective_free_mb",
+                                        self.get_vram_info()["free_mb"])
+
+    def get_ocr_workers_possible(self, vram_per_worker_mb: int = 3000,
+                                  safety_margin_mb: int = 1500) -> int:
+        """
+        基于当前有效空闲显存估算可并行的OCR子进程数。
+
+        Args:
+            vram_per_worker_mb: 单个OCR子进程预估VRAM占用 (默认3000MB)
+            safety_margin_mb: VRAM安全裕量，低于此值返回1 (默认1500MB)
+
+        Returns:
+            可安全并行的OCR worker数 (≥1)
+        """
+        vram = self.get_vram_info()
+        effective_free = vram.get("effective_free_mb", vram["free_mb"])
+        available = effective_free - safety_margin_mb
+        if available <= vram_per_worker_mb:
+            return 1
+        return max(1, min(3, available // vram_per_worker_mb))
+
+    def log_vram_snapshot(self, tag: str = ""):
+        """
+        记录显存快照 — OCR/嵌入前后用于排查显存泄漏。
+
+        用法:
+            monitor.log_vram_snapshot("OCR前")
+            # ... OCR ...
+            monitor.log_vram_snapshot("OCR后")
+        """
+        vram = self.get_vram_info()
+        ram = self.get_system_ram_info()
+        tag_str = f" [{tag}]" if tag else ""
+        print(
+            f"   [VRAM{tag_str}] "
+            f"GPU: {vram['used_mb']}MB used / {vram['total_mb']}MB total, "
+            f"free={vram['free_mb']}MB, "
+            f"eff_free={vram.get('effective_free_mb', 'N/A')}MB, "
+            f"workers_possible={self.get_ocr_workers_possible()}"
+        )
+        """返回当前空闲显存 (MB)"""
+        return self.get_vram_info().get("effective_free_mb",
+                                        self.get_vram_info()["free_mb"])
+
+    def get_system_ram_info(self) -> dict:
+        """获取系统内存信息"""
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            return {
+                "total_gb": round(mem.total / 1024**3, 1),
+                "used_gb": round(mem.used / 1024**3, 1),
+                "free_gb": round(mem.available / 1024**3, 1),
+                "pct": mem.percent,
+            }
+        except ImportError:
+            return {"error": "psutil 未安装"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_disk_space(self, path: str = None) -> dict:
+        """获取磁盘空间，默认检查 OCR 临时目录"""
+        import shutil
+        if path is None:
+            path = os.environ.get("TEMP", "C:/Windows/Temp")
+        try:
+            usage = shutil.disk_usage(path)
+            return {
+                "path": path,
+                "total_gb": round(usage.total / 1024**3, 1),
+                "used_gb": round(usage.used / 1024**3, 1),
+                "free_gb": round(usage.free / 1024**3, 1),
+                "pct": round(usage.used / usage.total * 100, 1),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def wait_for_vram(self,
+                      min_free_mb: Optional[int] = None,
+                      timeout_s: Optional[float] = None) -> bool:
+        """
+        等待 GPU 显存释放到指定阈值
+        (LLM/OCR 均为外部服务，本地仅运行嵌入/重排模型)
+
+        策略:
+          1. 检查空闲显存 >= min_free_mb → 立即返回 True
+          2. 空闲不足 → 等待较短时间后强制执行 (避免永久阻塞)
+
+        Args:
+            min_free_mb: 所需最小空闲显存，默认使用实例配置
+            timeout_s: 最大等待时间，默认使用实例配置
+
+        Returns:
+            True: 显存充足或等待后恢复
+            False: 超时仍未恢复 (会强制执行)
+        """
+        if min_free_mb is None:
+            min_free_mb = self.min_free_vram_mb
+        if timeout_s is None:
+            timeout_s = self.max_wait_s
+
+        t_start = time.time()
+
+        while True:
+            vram = self.get_vram_info()
+            # 用有效空闲（含 WDDM 可回收缓存），而非 nvidia-smi 报告值
+            free_mb = vram.get("effective_free_mb", vram["free_mb"])
+            elapsed = time.time() - t_start
+
+            if free_mb >= min_free_mb:
+                if elapsed > self.poll_interval_s:
+                    logger.info(
+                        f"显存恢复: {free_mb}MB 空闲 (等待了 {elapsed:.0f}s)"
+                    )
+                return True
+
+            if elapsed >= timeout_s:
+                logger.warning(
+                    f"等待显存超时 ({elapsed:.0f}s)，当前空闲: {free_mb}MB，"
+                    f"阈值: {min_free_mb}MB，强制执行"
+                )
+                return True  # 超时也继续，避免永久阻塞
+
+            # 显存不足 — 可能是嵌入/重排模型或其他进程占用
+            # 等待较短时间后强制执行
+            short_timeout = min(timeout_s, 30.0)
+            if elapsed >= short_timeout:
+                logger.warning(
+                    f"显存持续不足 ({free_mb}MB < {min_free_mb}MB)，"
+                    f"强制执行入库"
+                )
+                return True
+
+            time.sleep(self.poll_interval_s)
+
+    def __del__(self):
+        if self._nvml_available:
+            try:
+                self._nvml.nvmlShutdown()
+            except Exception:
+                pass
+
+
+# 全局单例
+_monitor: Optional[GpuMonitor] = None
+
+
+def get_gpu_monitor(min_free_vram_mb: int = 3000) -> GpuMonitor:
+    """获取全局 GPU 监控器单例"""
+    global _monitor
+    if _monitor is None:
+        _monitor = GpuMonitor(min_free_vram_mb=min_free_vram_mb)
+    return _monitor
+
+
+def log_vram_snapshot(tag: str = ""):
+    """模块级便捷函数 — 记录显存快照"""
+    try:
+        monitor = get_gpu_monitor()
+        monitor.log_vram_snapshot(tag)
+    except Exception:
+        pass
+
+
+def get_ocr_workers_possible(vram_per_worker_mb: int = 3000,
+                              safety_margin_mb: int = 1500) -> int:
+    """模块级便捷函数 — 获取可并行的OCR worker数"""
+    try:
+        monitor = get_gpu_monitor()
+        return monitor.get_ocr_workers_possible(vram_per_worker_mb, safety_margin_mb)
+    except Exception:
+        return 1

@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data files (large)
+data/
+logs/
+
+# Models (large binary files)
+models/*.bin
+models/*.pt
+models/*.pth
+models/*.onnx
+models/*.gguf
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Milvus
+milvus_data/
+
+# Debug & benchmark temp files
+_*.log
+_*.txt
+_*.json
+bench_*.txt
+context_debug*.txt
+
+# Node (Vue frontend)
+node_modules/
+src/ui-vue2/node_modules/
+src/ui-vue2/dist/
+
+# SQLite / screenshots
+*.db
+src/api/*.png
