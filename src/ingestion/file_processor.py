@@ -15,6 +15,7 @@ import json
 import hashlib
 import sqlite3
 import shutil
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Callable
@@ -30,6 +31,20 @@ from ingestion.pdf_parser import PDFParser
 from ingestion.chunker import Chunker, Chunk
 from ingestion.embedder import Embedder, create_text_for_embedding
 from ingestion.milvus_store import MilvusStore
+from ingestion.metadata_sync import (
+    inherit_registry_metadata,
+    normalize_metadata_updates,
+    synchronize_metadata,
+)
+from ingestion.ocr_fallback import choose_page_text
+from ingestion.document_editor import (
+    LayoutEditError,
+    LayoutRevisionConflict,
+    apply_layout_edits,
+    count_visual_assets,
+    layout_page_texts,
+    layout_revision,
+)
 
 
 class FileStatus(str, Enum):
@@ -99,6 +114,8 @@ class FileProcessor:
         self.chunker = Chunker(config_path)
         self.embedder = None  # 延迟加载
         self.store = MilvusStore(config_path)
+        self._metadata_lock = threading.RLock()
+        self._index_lock = threading.RLock()
 
         # 数据库路径 (已由 load_config 解析为绝对路径)
         self.db_path = self.config["paths"]["metadata_db"]
@@ -218,6 +235,7 @@ class FileProcessor:
                 domain: str = None,
                 category: str = None,
                 progress_callback: Callable[[str, float], None] = None,
+                force_reindex: bool = False,
                 ) -> ProcessResult:
         """
         处理单个文件: parse → chunk → embed → insert
@@ -248,29 +266,46 @@ class FileProcessor:
 
         # 检查是否已入库
         existing = self._get_registry(file_hash)
-        if existing and existing["status"] == "completed":
-            # 如果文件名变了（重命名再上传），更新注册表中的 file_name 和 original_path
-            old_name = existing.get("file_name", "")
-            if file_name != old_name:
-                self._upsert_registry(file_hash, file_name=file_name,
-                                      original_path=file_path)
-            return ProcessResult(
-                file_path=file_path, file_hash=file_hash, file_name=file_name,
-                status=FileStatus.COMPLETED,
-                chunks_created=existing["chunks_count"],
-                chars_extracted=existing["chars_count"],
-                domain=existing.get("domain", ""),
-                error_message="文件已入库，无需重复处理"
+        if existing and existing["status"] == "completed" and not force_reindex:
+            # 旧版本只保存了文本 chunks，没有 layout cache。此类文件即使
+            # 已完成，也必须重新走 8001 pipeline 才能补齐版面数据。
+            layout_cache = Path(self.config["paths"].get("parsed_cache", "data/parsed_cache")) / f"{file_hash}.layout.json"
+            needs_layout_rebuild = (
+                file_ext in (".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif")
+                and self.config.get("ocr", {}).get("enabled", False)
+                and not layout_cache.exists()
             )
+            if needs_layout_rebuild:
+                print(f"[OCR] 已完成文件缺少版面缓存，重新调用 8001 pipeline: {file_name}", flush=True)
+                force_reindex = True
+            else:
+                # 如果文件名变了（重命名再上传），更新注册表中的 file_name 和 original_path
+                old_name = existing.get("file_name", "")
+                if file_name != old_name:
+                    self._upsert_registry(file_hash, file_name=file_name,
+                                          original_path=file_path)
+                return ProcessResult(
+                    file_path=file_path, file_hash=file_hash, file_name=file_name,
+                    status=FileStatus.COMPLETED,
+                    chunks_created=existing["chunks_count"],
+                    chars_extracted=existing["chars_count"],
+                    domain=existing.get("domain", ""),
+                    error_message="文件已入库，无需重复处理"
+                )
 
         result = ProcessResult(
             file_path=file_path, file_hash=file_hash, file_name=file_name,
             status=FileStatus.PROCESSING, file_type=file_ext
         )
 
-        # 登记为 processing
-        self._upsert_registry(file_hash, file_name, file_path, file_size, file_ext,
-                              status="processing")
+        preserve_existing = bool(existing and existing["status"] == "completed")
+        # A rebuild leaves the completed registry row untouched until the
+        # staged collection is verified and activated.
+        if not preserve_existing:
+            self._upsert_registry(
+                file_hash, file_name, file_path, file_size, file_ext,
+                status="processing",
+            )
 
         try:
             # ===== Step 1: 解析 =====
@@ -278,6 +313,12 @@ class FileProcessor:
                 progress_callback("解析文件", 0.0)
 
             file_meta = self._build_file_meta(file_path, file_hash, domain, category)
+            file_meta = inherit_registry_metadata(
+                file_meta,
+                existing,
+                explicit_domain=domain,
+                explicit_category=category,
+            )
             file_ext_lower = file_meta.get("extension", "").lower()
 
             # PDF + OCR 场景: 渐进入库，避免全部OCR完才嵌入
@@ -286,7 +327,8 @@ class FileProcessor:
                 if ocr_cfg.get("enabled"):
                     progressive_result = self._process_pdf_progressive(
                         file_path, file_meta, file_hash, file_name,
-                        file_size, file_ext, result, progress_callback
+                        file_size, file_ext, result, progress_callback,
+                        preserve_existing=preserve_existing,
                     )
                     if progressive_result is not None:
                         return progressive_result  # 已处理完成（成功或失败）
@@ -304,8 +346,11 @@ class FileProcessor:
             if not chunks:
                 result.status = FileStatus.FAILED
                 result.error_message = "解析后无有效文本内容"
-                self._upsert_registry(file_hash, file_name, file_path, file_size, file_ext,
-                                      status="failed", error=result.error_message)
+                if not preserve_existing:
+                    self._upsert_registry(
+                        file_hash, file_name, file_path, file_size, file_ext,
+                        status="failed", error=result.error_message,
+                    )
                 return result
 
             if progress_callback:
@@ -324,16 +369,18 @@ class FileProcessor:
         except MemoryError:
             result.status = FileStatus.FAILED
             result.error_message = "内存不足: 文档过大导致chunker递归溢出, 请尝试拆分文件后重新入库"
-            self._upsert_registry(file_hash, file_name, file_path, file_size, file_ext,
-                                  status="failed", error=result.error_message)
+            if not preserve_existing:
+                self._upsert_registry(file_hash, file_name, file_path, file_size, file_ext,
+                                      status="failed", error=result.error_message)
         except Exception as e:
             result.status = FileStatus.FAILED
             result.error_message = str(e) or type(e).__name__
             if not result.error_message.strip():
                 result.error_message = f"未知错误: {type(e).__name__}"
             result.error_message = result.error_message[:500]
-            self._upsert_registry(file_hash, file_name, file_path, file_size, file_ext,
-                                  status="failed", error=result.error_message)
+            if not preserve_existing:
+                self._upsert_registry(file_hash, file_name, file_path, file_size, file_ext,
+                                      status="failed", error=result.error_message)
 
         return result
 
@@ -397,26 +444,50 @@ class FileProcessor:
         if not file_hash:
             return False
 
-        # 获取注册表信息（用于后续清理物理文件）
-        reg = self._get_registry(file_hash)
+        with self._metadata_lock, self._index_lock:
+            # 获取注册表信息（用于后续清理物理文件）
+            reg = self._get_registry(file_hash)
 
-        # Milvus 删除
-        self.store.delete_by_file_hash(file_hash)
+            # Delete from the active alias *and* retained rollback generations.
+            # Keeping an old generation here caused re-uploading identical
+            # bytes to resurrect its former OCR edits.
+            purge = getattr(self.store, "purge_file_generations", None)
+            if callable(purge):
+                purge(file_hash)
+            else:
+                self.store.delete_by_file_hash(file_hash)
 
-        # 清理物理文件（安全策略：仅删除 uploads 目录下的文件）
-        if remove_file and reg:
-            file_path = reg.get("original_path") or reg.get("stored_path") or ""
-            if file_path and os.path.exists(file_path):
-                try:
-                    uploads_abs = str(self.uploads_dir.resolve())
-                    file_abs = str(Path(file_path).resolve())
-                    if file_abs.startswith(uploads_abs):
-                        os.remove(file_path)
-                except Exception:
-                    pass
+            # Layout caches are keyed by content hash, so both the current
+            # renderer cache and the published-edit sidecar must go together.
+            cache_dir = Path(self.config["paths"].get("parsed_cache", "data/parsed_cache"))
+            cache_paths = [
+                cache_dir / f"{file_hash}.layout.json",
+                cache_dir / f"{file_hash}.layout.edited.json",
+                cache_dir / f"{file_hash}.layout.json.tmp",
+                cache_dir / f"{file_hash}.layout.edited.json.tmp",
+            ]
+            # A process interrupted during an edit can leave only its hidden
+            # publish/restore artifacts behind. They are not valid preview
+            # sources, but removing them makes deletion genuinely hash-clean.
+            cache_paths.extend(cache_dir.glob(f".{file_hash}.layout*.pending"))
+            cache_paths.extend(cache_dir.glob(f".{file_hash}.layout*.restore"))
+            for cache_path in cache_paths:
+                cache_path.unlink(missing_ok=True)
 
-        # 注册表标记
-        self._upsert_registry(file_hash, status="deleted")
+            # 清理物理文件（安全策略：仅删除 uploads 目录下的文件）
+            if remove_file and reg:
+                file_path = reg.get("original_path") or reg.get("stored_path") or ""
+                if file_path and os.path.exists(file_path):
+                    try:
+                        uploads_abs = str(self.uploads_dir.resolve())
+                        file_abs = str(Path(file_path).resolve())
+                        if file_abs.startswith(uploads_abs):
+                            os.remove(file_path)
+                    except Exception:
+                        pass
+
+            # 注册表标记。重新上传相同内容时会重新走 OCR 和入库流程。
+            self._upsert_registry(file_hash, status="deleted")
         return True
 
     def sync_orphans(self, dry_run: bool = False,
@@ -561,7 +632,7 @@ class FileProcessor:
     def reindex(self, identifier: str,
                 progress_callback: Callable = None) -> ProcessResult:
         """
-        重建文件索引（先删后加）
+        通过影子集合重建文件索引，验证后原子切换活动别名。
 
         Args:
             identifier: 文件 hash 或文件路径
@@ -588,9 +659,166 @@ class FileProcessor:
                 status=FileStatus.FAILED, error_message="原始文件不存在，无法重建索引"
             )
 
-        # 先删后加
-        self.delete(file_hash)
-        return self.process(file_path, progress_callback=progress_callback)
+        return self.process(
+            file_path,
+            domain=reg.get("domain") or None,
+            category=reg.get("category") or None,
+            progress_callback=progress_callback,
+            force_reindex=True,
+        )
+
+    def save_layout_edits(self, identifier: str, base_revision: str,
+                          edits: list) -> dict:
+        """Publish preview edits to layout cache and Milvus as one operation.
+
+        The original PDF/image remains immutable.  A staged Milvus generation
+        is validated before publication; cache files and the active alias are
+        compensated back to their previous versions if any publish step fails.
+        """
+        file_hash = self._resolve_hash(identifier)
+        if not file_hash:
+            raise LayoutEditError("文件未找到")
+        registry = self._get_registry(file_hash)
+        if not registry or registry.get("status") != "completed":
+            raise LayoutEditError("只有已完成入库的文件可以编辑")
+
+        cache_dir = Path(self.config["paths"].get("parsed_cache", "data/parsed_cache"))
+        layout_path = cache_dir / f"{file_hash}.layout.json"
+        edited_path = cache_dir / f"{file_hash}.layout.edited.json"
+        if not layout_path.exists():
+            raise LayoutEditError("当前文件没有可编辑的版面缓存")
+
+        t_start = time.time()
+        generation = None
+        cache_published = False
+        edited_published = False
+        layout_before = None
+        edited_before = None
+        layout_pending = layout_path.with_name(
+            f".{layout_path.name}.{threading.get_ident()}.pending"
+        )
+        edited_pending = edited_path.with_name(
+            f".{edited_path.name}.{threading.get_ident()}.pending"
+        )
+
+        with self._metadata_lock, self._index_lock:
+            try:
+                layout_before = layout_path.read_bytes()
+                edited_before = edited_path.read_bytes() if edited_path.exists() else None
+                current_layout = json.loads(layout_before.decode("utf-8"))
+                current_revision = layout_revision(current_layout)
+                if not base_revision or base_revision != current_revision:
+                    raise LayoutRevisionConflict(
+                        "文档已被其他操作更新，请刷新预览后重新编辑"
+                    )
+
+                next_layout, audit_rows = apply_layout_edits(current_layout, edits)
+                next_revision = layout_revision(next_layout)
+                if next_revision == current_revision:
+                    raise LayoutEditError("修改内容与当前版本相同")
+
+                file_path = registry.get("original_path") or registry.get("stored_path") or ""
+                file_meta = self._build_file_meta(
+                    file_path or registry.get("file_name") or "",
+                    file_hash,
+                    registry.get("domain") or None,
+                    registry.get("category") or None,
+                )
+                file_meta = inherit_registry_metadata(file_meta, registry)
+                page_texts = layout_page_texts(next_layout)
+                total_pages = max((page for page, _ in page_texts), default=1)
+                chunks = []
+                for page_num, text in page_texts:
+                    if text.strip():
+                        chunks.extend(self.chunker.chunk_page_text(
+                            text, page_num, total_pages, file_meta
+                        ))
+
+                if chunks and self.embedder is None:
+                    self._wait_for_gpu_slot("文档编辑向量同步")
+                    self.embedder = Embedder(self.config_path)
+
+                generation = self.store.begin_file_generation(file_hash)
+                embed_total_ms = 0.0
+                for offset in range(0, len(chunks), 20):
+                    batch = chunks[offset:offset + 20]
+                    embedding_texts = [create_text_for_embedding(chunk) for chunk in batch]
+                    t_embed = time.time()
+                    encoded = self.embedder.encode(embedding_texts, show_progress=False)
+                    embed_total_ms += (time.time() - t_embed) * 1000
+                    generation.insert(
+                        chunks=batch,
+                        dense_vectors=encoded.dense_vectors,
+                        sparse_vectors=encoded.sparse_vectors,
+                        embedding_texts=embedding_texts,
+                    )
+                generation.validate(len(chunks), expected_chunks=chunks)
+
+                serialized = json.dumps(next_layout, ensure_ascii=False).encode("utf-8")
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                layout_pending.write_bytes(serialized)
+                edited_pending.write_bytes(serialized)
+
+                generation.activate()
+                layout_pending.replace(layout_path)
+                cache_published = True
+                edited_pending.replace(edited_path)
+                edited_published = True
+
+                chars_count = sum(chunk.char_count for chunk in chunks)
+                self._upsert_registry(
+                    file_hash,
+                    registry.get("file_name"),
+                    registry.get("original_path"),
+                    registry.get("file_size"),
+                    registry.get("file_type"),
+                    status="completed",
+                    chunks_count=len(chunks),
+                    chars_count=chars_count,
+                    domain=registry.get("domain") or "",
+                    category=registry.get("category") or "",
+                    doc_number=registry.get("doc_number") or "",
+                    parse_time=(time.time() - t_start) * 1000,
+                    embed_time=embed_total_ms,
+                )
+                generation.finalize()
+                return {
+                    "success": True,
+                    "file_hash": file_hash,
+                    "revision": next_revision,
+                    "changes": audit_rows,
+                    "chunks_created": len(chunks),
+                    "chars_indexed": chars_count,
+                    "visual_assets": count_visual_assets(next_layout),
+                    "total_time_ms": (time.time() - t_start) * 1000,
+                }
+            except BaseException:
+                rollback_error = None
+                try:
+                    if generation is not None:
+                        generation.rollback()
+                except BaseException as exc:
+                    rollback_error = exc
+                finally:
+                    # Cache restoration must still run if Milvus rollback itself
+                    # reports an error; otherwise the two stores could diverge.
+                    if cache_published and layout_before is not None:
+                        restore = layout_path.with_name(f".{layout_path.name}.restore")
+                        restore.write_bytes(layout_before)
+                        restore.replace(layout_path)
+                    if edited_published:
+                        if edited_before is None:
+                            edited_path.unlink(missing_ok=True)
+                        else:
+                            restore = edited_path.with_name(f".{edited_path.name}.restore")
+                            restore.write_bytes(edited_before)
+                            restore.replace(edited_path)
+                if rollback_error is not None:
+                    print(f"[EDIT] Milvus rollback failed: {rollback_error}", flush=True)
+                raise
+            finally:
+                layout_pending.unlink(missing_ok=True)
+                edited_pending.unlink(missing_ok=True)
 
     def list_files(self, status: str = None, domain: str = None,
                    limit: int = 100, offset: int = 0,
@@ -637,20 +865,61 @@ class FileProcessor:
         return rows
 
     def update_file_meta(self, file_hash: str, updates: dict) -> dict:
-        """更新文件元数据 (domain, category, doc_number 等)"""
-        allowed = {"domain", "category", "doc_number"}
-        filtered = {k: v for k, v in updates.items() if k in allowed}
+        """原子地同步注册表与 Milvus chunk 元数据。"""
+        filtered = normalize_metadata_updates(updates)
         if not filtered:
             return {"success": False, "error": "无可更新的字段"}
-        conn = self._get_db_connection()
-        sets = ", ".join(f"{k} = ?" for k in filtered)
-        vals = list(filtered.values())
-        vals.append(file_hash)
-        conn.execute(f"UPDATE file_registry SET {sets}, updated_at = datetime('now','localtime') WHERE file_hash = ?", vals)
-        conn.commit()
-        updated = conn.total_changes
-        conn.close()
-        return {"success": updated > 0, "updated": updated}
+        resolved_hash = self._resolve_hash(file_hash)
+        if not resolved_hash:
+            return {"success": False, "error": "文件未找到"}
+
+        with self._metadata_lock:
+            # Hold SQLite's writer lock across the Milvus operation so another
+            # process cannot concurrently reindex or edit the same registry row.
+            conn = self._get_db_connection()
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                registry_row = conn.execute(
+                    "SELECT * FROM file_registry WHERE file_hash = ?",
+                    (resolved_hash,),
+                ).fetchone()
+                if not registry_row:
+                    conn.rollback()
+                    return {"success": False, "error": "文件未找到"}
+                registry = dict(registry_row)
+
+                def commit_registry(values):
+                    sets = ", ".join(f"{key} = ?" for key in values)
+                    params = [*values.values(), resolved_hash]
+                    cursor = conn.execute(
+                        f"UPDATE file_registry SET {sets}, "
+                        "updated_at = datetime('now','localtime') "
+                        "WHERE file_hash = ?",
+                        params,
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("File registry row disappeared during update")
+                    conn.commit()
+
+                chunk_count = synchronize_metadata(
+                    file_hash=resolved_hash,
+                    updates=filtered,
+                    expected_chunks=int(registry.get("chunks_count") or 0),
+                    store=self.store,
+                    commit_registry=commit_registry,
+                )
+            except BaseException:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        return {
+            "success": True,
+            "updated": 1,
+            "chunks_updated": chunk_count,
+            "file_hash": resolved_hash,
+        }
 
     def get_distinct_subcategories(self, domain: str = None, category: str = None) -> list:
         """返回去重子类目列表，供前端级联选择器"""
@@ -798,7 +1067,8 @@ class FileProcessor:
 
     def _process_pdf_progressive(self, file_path, file_meta, file_hash, file_name,
                                   file_size, file_ext, result: ProcessResult,
-                                  progress_callback=None) -> Optional[ProcessResult]:
+                                  progress_callback=None,
+                                  preserve_existing: bool = False) -> Optional[ProcessResult]:
         """
         PDF 按页入库 — 保留页码, 结构化分块
 
@@ -814,6 +1084,30 @@ class FileProcessor:
         parsed = self.pdf_parser.parse(file_path)
         page_count = parsed.get("page_count", 0)
         needs_ocr = parsed.get("needs_ocr_pages", [])
+        cache_dir = Path(self.config["paths"].get("parsed_cache", "data/parsed_cache"))
+        edited_layout_path = cache_dir / f"{file_hash}.layout.edited.json"
+        edited_page_texts = {}
+        if edited_layout_path.exists():
+            # A user-edited layout is the published source of truth.  Reindexing
+            # must rebuild vectors from it rather than silently restoring OCR
+            # text/images from the immutable original PDF.
+            try:
+                edited_layout = json.loads(edited_layout_path.read_text(encoding="utf-8"))
+                edited_page_texts = dict(layout_page_texts(edited_layout))
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                (cache_dir / f"{file_hash}.layout.json").write_text(
+                    json.dumps(edited_layout, ensure_ascii=False), encoding="utf-8"
+                )
+                needs_ocr = []
+                print(
+                    f"   [EDIT] 保留已发布编辑版面，共 {len(edited_page_texts)} 页",
+                    flush=True,
+                )
+            except (OSError, ValueError, LayoutEditError) as exc:
+                raise RuntimeError(f"已编辑版面缓存损坏，拒绝覆盖: {exc}") from exc
+        elif self.config.get("ocr", {}).get("always_pipeline"):
+            needs_ocr = list(range(1, page_count + 1))
+            print(f"   [OCR] always_pipeline=true，8001 Pipeline 处理全部 {page_count} 页", flush=True)
 
         # 批量识别所有需要 OCR 的页面 (VL 服务逐页调用)
         ocr_texts = {}
@@ -821,17 +1115,45 @@ class FileProcessor:
             if progress_callback:
                 progress_callback(f"OCR识别 ({len(needs_ocr)}页)", 0.1)
             print(f"   [OCR] 外部 VL 服务识别 {len(needs_ocr)} 页...")
-            ocr_texts = self.pdf_parser.ocr_pages(file_path, [p - 1 for p in needs_ocr])
+            try:
+                ocr_texts = self.pdf_parser.ocr_pages(
+                    file_path, [p - 1 for p in needs_ocr]
+                )
+                layout_pages = getattr(self.pdf_parser._vl_client, "last_layout_pages", {})
+                if layout_pages:
+                    cache_dir = Path(self.config["paths"].get("parsed_cache", "data/parsed_cache"))
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    layout_path = cache_dir / f"{file_hash}.layout.json"
+                    layout_path.write_text(
+                        json.dumps(layout_pages, ensure_ascii=False), encoding="utf-8"
+                    )
+                    print(f"   [OCR] 已缓存 {len(layout_pages)} 页版面块: {layout_path.name}")
+            except Exception as exc:
+                # OCR is an enhancement. Retain the parser's existing text for
+                # every affected page when the external OCR service fails.
+                print(f"   [OCR] 服务异常，回退 PDF 原文本: {exc}")
+                ocr_texts = {}
             if progress_callback:
                 progress_callback("OCR完成, 分块中...", 0.5)
 
         # 按页分块: 每页保留 page_num, chunk_id 唯一
         all_chunks = []
         total_chars = 0
+        # 垃圾 OCR 检测 (小模型幻觉/重复输出)
+        from ingestion.vl_ocr import is_garbage_ocr_text
+
         for page in parsed.get("pages", []):
             pn = page.get("page_num", 1)
-            if page.get("needs_ocr"):
-                text = ocr_texts.get(pn - 1, "")
+            if edited_page_texts:
+                text = edited_page_texts.get(pn, "")
+            elif page.get("needs_ocr"):
+                text, text_source = choose_page_text(
+                    page.get("text", ""),
+                    ocr_texts.get(pn - 1, ""),
+                    is_garbage_ocr_text,
+                )
+                if text_source == "pdf_text_fallback":
+                    print(f"   [OCR] 第{pn}页 OCR 无效，已保留 PDF 原文本")
             else:
                 text = page.get("text", "")
             if not (text or "").strip():
@@ -848,9 +1170,11 @@ class FileProcessor:
         if not all_chunks:
             result.status = FileStatus.FAILED
             result.error_message = "解析后无有效文本内容 (含OCR)"
-            self._upsert_registry(file_hash, file_name, file_path, file_size,
-                                  file_ext, status="failed",
-                                  error=result.error_message)
+            if not preserve_existing:
+                self._upsert_registry(
+                    file_hash, file_name, file_path, file_size,
+                    file_ext, status="failed", error=result.error_message,
+                )
             return result
 
         result.chunks_created = len(all_chunks)
@@ -860,7 +1184,7 @@ class FileProcessor:
         result.doc_number = file_meta.get("doc_number", "")
         result.parse_time_ms = (time.time() - t_start) * 1000
 
-        # ponytail: 统一走嵌入路径, _embed_and_insert 内部 delete_by_file_hash
+        # 统一走影子集合嵌入路径，活动集合在完整验证前保持不变。
         return self._embed_and_insert(all_chunks, result, file_hash, file_name,
                                       file_path, file_size, file_ext,
                                       t_start, progress_callback)
@@ -877,56 +1201,59 @@ class FileProcessor:
         BATCH = 20
         total = len(chunks)
         embed_total_ms = 0.0
-        first_batch = True
+        generation = None
+        with self._index_lock:
+            try:
+                generation = self.store.begin_file_generation(file_hash)
+                for i in range(0, total, BATCH):
+                    batch = chunks[i:i + BATCH]
+                    batch_texts = [create_text_for_embedding(c) for c in batch]
 
-        for i in range(0, total, BATCH):
-            batch = chunks[i:i + BATCH]
-            batch_texts = [create_text_for_embedding(c) for c in batch]
+                    if progress_callback:
+                        end = min(i + BATCH, total)
+                        progress_callback(
+                            f"嵌入 ({i + 1}-{end}/{total})",
+                            i / total * 0.9,
+                        )
 
-            if progress_callback:
-                end = min(i + BATCH, total)
-                progress_callback(
-                    f"嵌入 ({i + 1}-{end}/{total})",
-                    i / total * 0.9,
+                    t_embed = time.time()
+                    emb_result = self.embedder.encode(
+                        batch_texts, show_progress=False
+                    )
+                    embed_total_ms += (time.time() - t_embed) * 1000
+                    generation.insert(
+                        chunks=batch,
+                        dense_vectors=emb_result.dense_vectors,
+                        sparse_vectors=emb_result.sparse_vectors,
+                        embedding_texts=batch_texts,
+                    )
+                    del emb_result, batch_texts
+
+                generation.validate(total, expected_chunks=chunks)
+                generation.activate()
+
+                result.embed_time_ms = embed_total_ms
+                result.status = FileStatus.COMPLETED
+                result.total_time_ms = (time.time() - t_start) * 1000
+
+                # The registry becomes completed only after the alias switch.
+                # If this commit fails, rollback switches the alias back.
+                self._upsert_registry(
+                    file_hash, file_name, file_path, file_size, file_ext,
+                    status="completed",
+                    chunks_count=len(chunks),
+                    chars_count=result.chars_extracted,
+                    domain=result.domain,
+                    category=result.category,
+                    doc_number=result.doc_number,
+                    parse_time=result.parse_time_ms,
+                    embed_time=result.embed_time_ms,
                 )
-
-            t_embed = time.time()
-            emb_result = self.embedder.encode(batch_texts, show_progress=False)
-            embed_total_ms += (time.time() - t_embed) * 1000
-
-            if first_batch:
-                self.store.delete_by_file_hash(file_hash)
-                first_batch = False
-
-            self.store.insert(
-                chunks=batch,
-                dense_vectors=emb_result.dense_vectors,
-                sparse_vectors=emb_result.sparse_vectors,
-                embedding_texts=batch_texts,
-                batch_size=len(batch),
-            )
-            del emb_result, batch_texts
-
-        result.embed_time_ms = embed_total_ms
-        result.status = FileStatus.COMPLETED
-        result.total_time_ms = (time.time() - t_start) * 1000
-
-        # ponytail: Milvus 写入成功但注册表更新失败时回滚, 避免孤 chunk
-        try:
-            self._upsert_registry(
-                file_hash, file_name, file_path, file_size, file_ext,
-                status="completed",
-                chunks_count=len(chunks),
-                chars_count=result.chars_extracted,
-                domain=result.domain,
-                category=result.category,
-                doc_number=result.doc_number,
-                parse_time=result.parse_time_ms,
-                embed_time=result.embed_time_ms,
-            )
-        except Exception:
-            self.store.delete_by_file_hash(file_hash)
-            raise
+                generation.finalize()
+            except BaseException:
+                if generation is not None:
+                    generation.rollback()
+                raise
         return result
 
     def _wait_for_gpu_slot(self, task_name: str = "入库", min_free_mb: int = 2500):
@@ -1023,6 +1350,42 @@ class FileProcessor:
                 # 此分支仅当 OCR 禁用时走到
                 parsed = self.pdf_parser.parse(file_path)
                 return self.chunker.chunk_pdf_document(parsed, file_meta)
+
+        # 图片：上传接口允许 PNG/JPEG，但此前只在 PDF 页面路径中调用
+        # VL-OCR，导致独立图片落入“其他”分支并被判定为无有效文本。
+        # 复用同一 OCR 客户端（当前配置为 8001 PaddleOCR pipeline），
+        # 保持与 PDF OCR 相同的 Markdown/表格识别结果。
+        elif ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif"):
+            cache_dir = Path(self.config["paths"].get("parsed_cache", "data/parsed_cache"))
+            edited_path = cache_dir / f"{file_meta.get('file_hash')}.layout.edited.json"
+            if edited_path.exists():
+                try:
+                    layout_blocks = json.loads(edited_path.read_text(encoding="utf-8"))
+                    page_text = layout_page_texts(layout_blocks)
+                    text = "\n\n".join(value for _, value in page_text if value.strip())
+                    (cache_dir / f"{file_meta.get('file_hash')}.layout.json").write_text(
+                        json.dumps(layout_blocks, ensure_ascii=False), encoding="utf-8"
+                    )
+                    print("   [EDIT] 图片重新入库保留已发布编辑版面", flush=True)
+                    return self._chunk_text_safe(text, file_meta) if text.strip() else []
+                except (OSError, ValueError, LayoutEditError) as exc:
+                    raise RuntimeError(f"已编辑版面缓存损坏，拒绝覆盖: {exc}") from exc
+            print(
+                f"[OCR-TRACE] image branch file={file_path} ext={ext} "
+                f"ocr_enabled={self.config.get('ocr', {}).get('enabled')} "
+                f"protocol={self.config.get('ocr', {}).get('vl', {}).get('protocol')} "
+                f"base_url={self.config.get('ocr', {}).get('vl', {}).get('base_url')}",
+                flush=True,
+            )
+            text, layout_blocks = self.pdf_parser.ocr_page_with_layout(file_path)
+            if layout_blocks:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                layout_path = cache_dir / f"{file_meta.get('file_hash')}.layout.json"
+                layout_path.write_text(json.dumps(layout_blocks, ensure_ascii=False), encoding="utf-8")
+                print(f"   [OCR] 已缓存版面块 {len(layout_blocks)} 个: {layout_path.name}")
+            if not text.strip():
+                return []
+            return self._chunk_text_safe(text, file_meta)
 
         # DOC (old binary Word format)
         elif ext == ".doc":

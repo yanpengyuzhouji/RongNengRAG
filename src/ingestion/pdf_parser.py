@@ -209,6 +209,14 @@ class PDFParser:
                 timeout=vl_cfg.get("timeout", 180),
                 dpi=self.ocr_config.get("dpi", 150),
                 max_image_dim=self.ocr_config.get("max_image_dim", 3000),
+                max_tokens=vl_cfg.get("max_tokens", 1024),
+                protocol=vl_cfg.get("protocol", "openai"),
+                endpoint=vl_cfg.get("endpoint", "/ocr"),
+            )
+            print(
+                f"[OCR] 主链路: {vl_cfg.get('protocol', 'openai')} "
+                f"{vl_cfg.get('base_url', 'http://localhost:8080')}{vl_cfg.get('endpoint', '/ocr')}",
+                flush=True,
             )
         return self._vl_client
 
@@ -253,3 +261,22 @@ class PDFParser:
         except Exception as e:
             print(f"   [OCR] 单图识别失败: {e}")
             return ""
+
+    def ocr_page_with_layout(self, image_path: str):
+        """Return OCR text plus the pipeline layout blocks for caching."""
+        client = self._get_vl_client()
+        if client is None:
+            print("[OCR-TRACE] no VL client; OCR disabled or unavailable", flush=True)
+            return "", []
+        try:
+            with open(image_path, "rb") as f:
+                text = client.recognize_image(f.read())
+            print(
+                f"[OCR-TRACE] image OCR completed protocol={client.protocol} "
+                f"base_url={client.base_url} blocks={len(getattr(client, 'last_layout_blocks', []) or [])}",
+                flush=True,
+            )
+            return text or "", list(getattr(client, "last_layout_blocks", []) or [])
+        except Exception as e:
+            print(f"   [OCR] 单图版面识别失败: {e}")
+            return "", []

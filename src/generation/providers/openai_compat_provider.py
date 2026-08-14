@@ -19,9 +19,13 @@ class OpenAICompatProvider(BaseProvider):
     def __init__(self, config: dict):
         from openai import OpenAI
 
-        self._model_name = config.get("model", "qwen2.5-7b-instruct")
+        self._model_name = config.get("model", "Qwen3-4B")
         self.temperature = config.get("temperature", 0.1)
         self.max_tokens_default = config.get("max_tokens", 4096)
+        # Qwen3-compatible servers (including vLLM) accept this OpenAI
+        # extension. Keep it configurable because unrelated providers may
+        # reject extra request fields.
+        self.enable_thinking = bool(config.get("enable_thinking", False))
 
         self.base_url = config.get(
             "base_url",
@@ -40,7 +44,8 @@ class OpenAICompatProvider(BaseProvider):
         )
 
         print(f"[llm] OpenAI兼容服务: {self.base_url}, model={self._model_name}"
-              f"{' (无API Key)' if not self.api_key else ''}")
+              f"{' (无API Key)' if not self.api_key else ''}, "
+              f"thinking={'on' if self.enable_thinking else 'off'}")
 
     @property
     def model_name(self) -> str:
@@ -52,13 +57,13 @@ class OpenAICompatProvider(BaseProvider):
         temp = temperature if temperature is not None else self.temperature
         mt = max_tokens if max_tokens is not None else self.max_tokens_default
 
-        response = self.client.chat.completions.create(
-            model=self._model_name,
-            messages=messages,
-            temperature=temp,
-            max_tokens=mt,
-            stream=False,
+        request = dict(
+            model=self._model_name, messages=messages, temperature=temp,
+            max_tokens=mt, stream=False,
         )
+        if not self.enable_thinking:
+            request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        response = self.client.chat.completions.create(**request)
         return response.choices[0].message.content
 
     def generate_stream(self, messages: List[Dict[str, str]], temperature: float = None,
@@ -67,13 +72,13 @@ class OpenAICompatProvider(BaseProvider):
         temp = temperature if temperature is not None else self.temperature
         mt = max_tokens if max_tokens is not None else self.max_tokens_default
 
-        response = self.client.chat.completions.create(
-            model=self._model_name,
-            messages=messages,
-            temperature=temp,
-            max_tokens=mt,
-            stream=True,
+        request = dict(
+            model=self._model_name, messages=messages, temperature=temp,
+            max_tokens=mt, stream=True,
         )
+        if not self.enable_thinking:
+            request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        response = self.client.chat.completions.create(**request)
         for chunk in response:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content

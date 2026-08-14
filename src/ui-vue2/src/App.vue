@@ -34,6 +34,7 @@
       />
       <KnowledgeBase v-else-if="activePage === 'kb'" @go-ai="activePage = 'ai'" @preview="onPreview" />
       <AIAssistant v-else-if="activePage === 'ai'" />
+      <ExcelWorkbench v-else-if="activePage === 'excel'" />
       <div v-else class="empty-page">
         <p>🚧 功能开发中</p>
       </div>
@@ -46,6 +47,7 @@ import { ref } from 'vue'
 import KnowledgeBase from './KnowledgeBase.vue'
 import AIAssistant from './AIAssistant.vue'
 import DocumentPreview from './DocumentPreview.vue'
+import ExcelWorkbench from './excel/ExcelWorkbench.vue'
 
 const activePage = ref('kb')
 const previewFile = ref(null)
@@ -58,6 +60,7 @@ const navItems = [
   { key: 'dashboard', label: '数据看板', page: false },
   { key: 'kb', label: '知识库', page: true },
   { key: 'ai', label: 'AI 助手', page: true },
+  { key: 'excel', label: 'Excel 分析', page: true },
   { key: 'report', label: '报告生成', page: false },
   { key: 'cost', label: '造价生成', page: false },
   { key: 'review', label: '智能审图', page: false },
@@ -66,7 +69,7 @@ const navItems = [
 ]
 
 function handleNav(item) {
-  if (item.key === 'ai' || item.key === 'kb') {
+  if (item.key === 'ai' || item.key === 'kb' || item.key === 'excel') {
     activePage.value = item.key
   }
 }

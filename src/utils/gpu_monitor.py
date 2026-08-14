@@ -237,6 +237,11 @@ class GpuMonitor:
 
         while True:
             vram = self.get_vram_info()
+
+            # 无 GPU 环境 (无 nvml 且无 CUDA 设备) — 显存监控无意义, 直接放行
+            if vram.get("device_index", 0) == -1:
+                return True
+
             # 用有效空闲（含 WDDM 可回收缓存），而非 nvidia-smi 报告值
             free_mb = vram.get("effective_free_mb", vram["free_mb"])
             elapsed = time.time() - t_start

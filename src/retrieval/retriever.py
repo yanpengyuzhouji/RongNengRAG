@@ -10,7 +10,10 @@
 import sys
 import os
 import time
+import json
+import re
 import yaml
+from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 
@@ -23,6 +26,11 @@ from retrieval.file_registry import (
 )
 from ingestion.embedder import Embedder
 from ingestion.milvus_store import MilvusStore
+from retrieval.cross_domain import apply_domain_override
+from retrieval.context_selection import select_context_chunks
+from retrieval.series import extract_series_key
+from ingestion.document_editor import layout_page_texts
+from retrieval.bm25_index import BM25Index
 
 
 @dataclass
@@ -113,8 +121,175 @@ class Retriever:
         self.store = MilvusStore(config_path)
         self.reranker = Reranker(config_path)
         self.file_registry = FileRegistry(config_path)
+        self._layout_text_cache = {}
+        self._bm25_index = None
+        self._bm25_signature = None
 
         self.retrieval_config = self.config["retrieval"]
+
+    def _ensure_bm25_index(self) -> Optional[BM25Index]:
+        """Build BM25 from the currently published Milvus generation."""
+        if not self.retrieval_config.get("bm25_enabled", True):
+            return None
+        try:
+            target = self.store._active_target()
+            stats = self.store.get_collection_stats()
+            row_count = int(stats.get("count", 0))
+            signature = (target, row_count)
+            if self._bm25_index is not None and self._bm25_signature == signature:
+                return self._bm25_index
+            rows = self.store.query_rows_for_bm25()
+            self._bm25_index = BM25Index(rows)
+            # Use the observed row count as well as Milvus stats: a staged
+            # generation may be visible before its stats are refreshed.
+            self._bm25_signature = (target, len(rows))
+            print(f"[bm25] 索引就绪: {len(rows)} 个 chunks, avgdl={self._bm25_index.avgdl:.1f}")
+            return self._bm25_index
+        except Exception as exc:
+            # BM25 is an additional recall branch.  A Milvus/API deployment
+            # must remain usable if a very large filtered snapshot is not
+            # available on a particular Milvus Lite version.
+            print(f"[bm25][WARN] 构建失败，回退向量检索: {exc}")
+            return None
+
+    def _merge_bm25_candidates(
+        self, query: str, candidates: List[dict], filter_expr: Optional[str], limit: int
+    ) -> List[dict]:
+        """Fuse Milvus dense+BGE-M3 results with corpus-aware BM25 scores."""
+        index = self._ensure_bm25_index()
+        if index is None or index.empty:
+            return candidates
+
+        allowed_ids = None
+        if filter_expr:
+            try:
+                allowed_ids = {
+                    str(row.get("chunk_id"))
+                    for row in self.store.query_rows_for_bm25(filter_expr)
+                    if row.get("chunk_id")
+                }
+            except Exception as exc:
+                print(f"[bm25][WARN] 过滤候选读取失败，忽略 BM25 过滤: {exc}")
+
+        bm25_candidates = index.search(query, limit=max(limit, 1), allowed_ids=allowed_ids)
+        if not bm25_candidates:
+            return candidates
+
+        vector_by_id = {}
+        for item in candidates or []:
+            entity = item.get("entity", item) if isinstance(item, dict) else {}
+            chunk_id = str(entity.get("chunk_id") or item.get("id") or "")
+            if chunk_id:
+                vector_by_id[chunk_id] = item
+
+        bm25_by_id = {
+            str(item.get("entity", {}).get("chunk_id") or item.get("id")): item
+            for item in bm25_candidates
+        }
+        all_ids = list(dict.fromkeys([*vector_by_id, *bm25_by_id]))
+        max_bm25 = max((float(item.get("_bm25_score", 0.0)) for item in bm25_candidates), default=0.0)
+        bm25_weight = min(0.8, max(0.0, float(self.retrieval_config.get("bm25_weight", 0.25))))
+        vector_weight = 1.0 - bm25_weight
+        merged = []
+        for chunk_id in all_ids:
+            vector_item = vector_by_id.get(chunk_id)
+            bm25_item = bm25_by_id.get(chunk_id)
+            item = dict(vector_item or bm25_item or {})
+            entity = dict((vector_item or bm25_item).get("entity", {}))
+            if bm25_item:
+                # BM25 rows contain the complete scalar metadata snapshot.
+                entity.update(bm25_item.get("entity", {}))
+            item["entity"] = entity
+            vector_score = float((vector_item or {}).get("distance", 0.0) or 0.0)
+            vector_score = min(1.0, max(0.0, vector_score))
+            bm25_score = float((bm25_item or {}).get("_bm25_score", 0.0) or 0.0)
+            bm25_norm = bm25_score / max_bm25 if max_bm25 > 0 else 0.0
+            # A lexical-only hit must remain eligible when the ANN branch did
+            # not return the same chunk; otherwise the BM25 branch could never
+            # recover an exact standard number missed by ANN.
+            fused = (
+                bm25_norm if not vector_item
+                else vector_weight * vector_score + bm25_weight * bm25_norm
+            )
+            item["distance"] = float(fused)
+            item["_vector_score"] = vector_score
+            item["_bm25_score"] = bm25_score
+            item["_retrieval_sources"] = (
+                "vector+bm25" if vector_item else "bm25"
+            )
+            merged.append(item)
+        merged.sort(key=lambda item: item.get("distance", 0.0), reverse=True)
+        return merged[:limit]
+
+    @staticmethod
+    def _consistency_text(value: str) -> str:
+        """Normalize layout/chunk text for stale-index consistency checks."""
+        plain = re.sub(r"<[^>]+>", " ", str(value or ""))
+        return re.sub(r"\s+", "", plain)
+
+    def _current_layout_pages(self, file_hash: str):
+        """Load the latest persisted layout text for one file, if available."""
+        if not file_hash or len(file_hash) < 64:
+            return None
+        cache_dir = Path(self.config["paths"].get("parsed_cache", "data/parsed_cache"))
+        candidates = [
+            cache_dir / f"{file_hash}.layout.edited.json",
+            cache_dir / f"{file_hash}.layout.json",
+        ]
+        for path in candidates:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            stamp = (stat.st_mtime_ns, stat.st_size)
+            cached = self._layout_text_cache.get(file_hash)
+            if cached and cached[0] == str(path) and cached[1] == stamp:
+                return cached[2]
+            try:
+                layout = json.loads(path.read_text(encoding="utf-8"))
+                pages = {
+                    page_num: text
+                    for page_num, text in layout_page_texts(layout)
+                    if str(text or "").strip()
+                }
+            except (OSError, ValueError, TypeError):
+                continue
+            self._layout_text_cache[file_hash] = (str(path), stamp, pages)
+            return pages
+        return None
+
+    @staticmethod
+    def _result_file_hash(item: dict) -> str:
+        entity = item.get("entity", item) if isinstance(item, dict) else {}
+        chunk_id = str(
+            entity.get("chunk_id")
+            or (item.get("chunk_id") if isinstance(item, dict) else "")
+            or (item.get("id") if isinstance(item, dict) else "")
+            or ""
+        )
+        prefix = chunk_id[:64]
+        return prefix if re.fullmatch(r"[0-9a-f]{64}", prefix) else ""
+
+    def _remove_stale_layout_results(self, candidates: list) -> list:
+        """Reject chunks that are not present in the current edited layout."""
+        filtered = []
+        for item in candidates or []:
+            entity = item.get("entity", item) if isinstance(item, dict) else {}
+            file_hash = self._result_file_hash(item)
+            pages = self._current_layout_pages(file_hash) if file_hash else None
+            if pages is not None:
+                candidate_text = self._consistency_text(entity.get("text", ""))
+                try:
+                    page_num = int(entity.get("page_num") or 0)
+                except (TypeError, ValueError):
+                    page_num = 0
+                current_text = self._consistency_text(
+                    pages.get(page_num, "") if page_num else "".join(pages.values())
+                )
+                if candidate_text and candidate_text not in current_text:
+                    continue
+            filtered.append(item)
+        return filtered
 
     def search(self, query: str, top_k: int = None,
                domain_filter: str = None,
@@ -139,9 +314,7 @@ class Retriever:
         aq = self.analyzer.analyze(query)
 
         # 手动域过滤覆盖
-        if domain_filter and not aq.domain:
-            aq.domain = domain_filter
-            aq.filter_expr = self.analyzer._build_filter_expr(aq)
+        apply_domain_override(aq, domain_filter, self.analyzer._build_filter_expr)
 
         # ===== 阶段1: 混合搜索粗召回 =====
         # 对查询进行嵌入
@@ -158,6 +331,15 @@ class Retriever:
             rrf_k=self.retrieval_config["rrf_k"],
             dense_weight=self.retrieval_config["dense_weight"],
             sparse_weight=self.retrieval_config["sparse_weight"],
+        )
+        candidates = self._remove_stale_layout_results(candidates)
+        # Milvus branch = Qwen dense + BGE-M3 learned sparse weights.
+        # Add a corpus-aware BM25 branch for exact standards/numbers/keywords.
+        candidates = self._merge_bm25_candidates(
+            query=query,
+            candidates=candidates,
+            filter_expr=aq.filter_expr,
+            limit=coarse_k,
         )
 
         # ===== 快照粗排候选（用于评估） =====
@@ -261,12 +443,18 @@ class Retriever:
         """
         aq = self.analyzer.analyze(query)
 
-        if not aq.parallel_domains:
-            # 自动选择可能相关的域
-            aq.parallel_domains = list(self.config["domain_keywords"].keys())
+        available_domains = list(self.config["domain_keywords"].keys())
+        domains = list(dict.fromkeys(aq.parallel_domains))
+        # 对比提示词是双域结构：显式识别不足两个时，
+        # 从已配置域中补齐，且始终去重。
+        for domain in available_domains:
+            if domain not in domains:
+                domains.append(domain)
+            if len(domains) >= 2:
+                break
 
         results = {}
-        for domain in aq.parallel_domains[:3]:  # 最多3个域
+        for domain in domains[:2]:
             results[domain] = self.search(query, top_k=top_k, domain_filter=domain)
 
         return results
@@ -286,6 +474,12 @@ class Retriever:
             sparse_vector=sparse_vec,
             filter_expr=aq.filter_expr,
             limit=100,  # 同一文档可能有很多 chunk
+        )
+        candidates = self._merge_bm25_candidates(
+            query=doc_number,
+            candidates=candidates,
+            filter_expr=aq.filter_expr,
+            limit=100,
         )
 
         results = []
@@ -308,15 +502,14 @@ class Retriever:
 
     def format_context_for_llm(self, results: List[RetrievalResult],
                                max_chunks: int = 15) -> str:
-        """将检索结果格式化为 LLM 上下文，按文件去重，不添加序号"""
-        chunks = results[:max_chunks]
-        seen = set()
-        deduped = []
-        for r in chunks:
-            k = r.file_path or r.chunk_id
-            if k not in seen:
-                seen.add(k)
-                deduped.append(r)
+        """按 chunk 去重并限制单文件占比后格式化 LLM 上下文。"""
+        deduped = select_context_chunks(
+            results,
+            max_chunks=max_chunks,
+            max_chunks_per_file=int(
+                self.retrieval_config.get("max_chunks_per_file", 3)
+            ),
+        )
 
         context_parts = []
         for result in deduped:
@@ -356,8 +549,19 @@ class Retriever:
         """
         chunks = []
 
-        # 策略1: 按 file_hash 精确查询（最可靠，chunk_id 前缀匹配）
+        # The edited layout is the authoritative source for file-scoped
+        # context. This prevents a stale Milvus generation from being injected
+        # into the prompt even when a caller names the document explicitly.
         if file_hash:
+            layout_pages = self._current_layout_pages(file_hash)
+            if layout_pages is not None:
+                chunks = [
+                    {"page_num": page_num, "text": text}
+                    for page_num, text in sorted(layout_pages.items())
+                ]
+
+        # 策略1: 按 file_hash 精确查询（最可靠，chunk_id 前缀匹配）
+        if file_hash and not chunks:
             chunks = self.store.query_by_file_hash(file_hash, sort_by_page=True)
 
         # 策略2: 按 file_path 查询
@@ -587,28 +791,47 @@ class Retriever:
             "year",
         ]
 
-        # Milvus 标量全量查询
+        # === 全量分页 + 在线聚合（不保留固定 20,000 行上限） ===
+        domain_counter = Counter()
+        cat_counter = Counter()
+        volt_counter = Counter()
+        pub_counter = Counter()
+        disc_counter = Counter()
+        year_counter = Counter()
+        seen_files = set()
+        file_chunk_counts = Counter()
+        total_chunks = 0
         try:
-            self.store.client.load_collection(self.store.COLLECTION_NAME)
-        except Exception:
-            pass
-        try:
-            raw_rows = self.store.client.query(
-                collection_name=self.store.COLLECTION_NAME,
-                filter=filter_expr or "",
-                output_fields=output_fields,
-                limit=20000,  # 全库 chunk 上限
-            )
+            for batch in self.store.iter_scalar_query(
+                filter_expr or "", output_fields, batch_size=1000
+            ):
+                for row in batch:
+                    entity = row.get("entity", row)
+                    total_chunks += 1
+                    domain_counter[entity.get("domain", "") or "未分类"] += 1
+                    cat_counter[entity.get("category", "") or "未分类"] += 1
+                    volt_counter[entity.get("voltage_level", "") or "未指定"] += 1
+                    pub_counter[entity.get("publish_level", "") or "未指定"] += 1
+                    disc_counter[entity.get("discipline", "") or "未指定"] += 1
+                    year = entity.get("year", 0)
+                    if year:
+                        year_counter[str(year)] += 1
+                    fp = entity.get("file_path", "")
+                    if fp:
+                        seen_files.add(fp)
+                        file_chunk_counts[fp] += 1
         except Exception as e:
-            print(f"[statistical] Milvus query failed: {e}")
+            print(f"[statistical] Milvus paged query failed: {e}")
             return StatisticalResult(
                 query_type=stats_type,
                 total_chunks=0,
                 unique_files=0,
-                formatted_table="[统计查询失败] 向量库查询出错，请稍后重试。",
+                formatted_table=(
+                    "[统计查询失败] 无法保证全量读取，未返回可能不完整的统计值。"
+                ),
             )
 
-        if not raw_rows:
+        if total_chunks == 0:
             return StatisticalResult(
                 query_type=stats_type,
                 total_chunks=0,
@@ -618,32 +841,6 @@ class Retriever:
                     " 的记录。\n",
             )
 
-        # === Python 聚合 ===
-        domain_counter = Counter()
-        cat_counter = Counter()
-        volt_counter = Counter()
-        pub_counter = Counter()
-        disc_counter = Counter()
-        year_counter = Counter()
-        seen_files = set()
-        file_chunk_counts = Counter()
-
-        for row in raw_rows:
-            entity = row.get("entity", row)
-            domain_counter[entity.get("domain", "") or "未分类"] += 1
-            cat_counter[entity.get("category", "") or "未分类"] += 1
-            volt_counter[entity.get("voltage_level", "") or "未指定"] += 1
-            pub_counter[entity.get("publish_level", "") or "未指定"] += 1
-            disc_counter[entity.get("discipline", "") or "未指定"] += 1
-            year = entity.get("year", 0)
-            if year:
-                year_counter[str(year)] += 1
-            fp = entity.get("file_path", "")
-            if fp:
-                seen_files.add(fp)
-                file_chunk_counts[fp] += 1
-
-        total_chunks = len(raw_rows)
         unique_files = len(seen_files)
 
         # 构建文件列表 (去重, 按 chunk 数降序)
@@ -689,6 +886,7 @@ class Retriever:
         parts.append(f"**查询**: {query} {domain_hint}")
         parts.append(f"**总计**: {result.total_chunks} 个文本块，"
                      f"来自 {result.unique_files} 个文件\n")
+        parts.append("_统计口径：已通过分页读取全部匹配记录。_\n")
 
         # 按域分布 (如果有多域或明确要求)
         if dims.get("domain") or len(result.by_domain) > 1:
@@ -772,17 +970,7 @@ class Retriever:
         Returns:
             系列标识字符串, 无匹配时返回 None
         """
-        import re as _re
-        # 会议材料系列: XX会议材料之X...
-        m = _re.search(r'会议材料之', filename)
-        if m:
-            return '会议材料之'
-        # 带有数字前缀+关键词的系列: "第X章" "第X部分" 等
-        m = _re.search(r'(?:第([一二三四五六七八九十\d]+)[章节部分篇])', filename)
-        if m:
-            return m.group(2)  # "第X章" 等
-        # 默认: 无系列标识，不排除
-        return None
+        return extract_series_key(filename)
 
 
 # 快速测试

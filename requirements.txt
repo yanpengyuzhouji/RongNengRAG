@@ -1,5 +1,6 @@
 # ===== Core RAG Framework =====
-pymilvus>=2.4.0          # Milvus Lite vector database (hybrid search)
+pymilvus>=2.4.0          # Milvus vector database client (hybrid search)
+milvus-lite>=3.0.0       # Milvus Lite 本地向量库引擎 (pymilvus 不自动带, 需显式安装)
 
 # ===== Embedding & Reranking =====
 sentence-transformers>=3.0.0  # BGE-M3 + BGE-Reranker
@@ -28,6 +29,7 @@ uvicorn[standard]>=0.30.0 # ASGI server
 pydantic>=2.0.0           # Data validation
 
 # ===== Utilities =====
+jieba>=0.42               # 中文分词 (query_analyzer 查询分析)
 pyyaml>=6.0               # Configuration
 python-dotenv>=1.0.0      # .env 环境变量
 rich>=13.0.0              # Console output formatting
@@ -39,3 +41,4 @@ python-multipart>=0.0.9   # File upload support
 
 # ===== 可选: GPU 监控 (无 GPU 环境可跳过) =====
 # nvidia-ml-py>=12.0.0
+httpx>=0.27              # Excel workbook proxy

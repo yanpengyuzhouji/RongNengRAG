@@ -1,5 +1,20 @@
 # RAG 知识库系统配置
 
+# ===== API 安全 =====
+security:
+  # 默认失败关闭：未配置 API key 时数据接口拒绝启动/访问。
+  require_auth: false
+  api_keys_env: "RONGNENG_API_KEYS_JSON"
+  single_api_key_env: "RONGNENG_API_KEY"
+  single_principal_env: "RONGNENG_API_PRINCIPAL"
+  # 服务器本地路径导入默认关闭。如确需开启，必须同时设置绝对路径白名单。
+  allow_local_path_import: false
+  local_path_import_roots: []
+  cors_origins:
+    - "http://192.168.0.7:5174"
+    - "http://localhost:5174"
+    - "http://127.0.0.1:5174"
+
 # ===== 路径配置 =====
 # 所有路径相对于项目根目录 (config.yaml 所在目录)
 # 也支持绝对路径，如 "D:/xx/xx"
@@ -156,47 +171,87 @@ chunking:
 # ===== OCR 配置 (扫描件 PDF 识别 — 外部 PaddleOCR-VL 服务) =====
 ocr:
   enabled: true                    # 是否启用 OCR (扫描件识别)
+  always_pipeline: true            # 上传解析统一走 8001 Pipeline，保留版面块；失败时回退原文
   provider: "vl"                   # 仅支持 "vl" — 外部 PaddleOCR-VL OpenAI兼容服务
   vl:
-    base_url: "http://192.168.0.201:8080"   # PaddleOCR-VL 服务地址
-    model: "paddleocr-vl-1.6"               # 模型名称
+    base_url: "http://192.168.0.201:8001"   # PaddleOCR pipeline 服务地址
+    protocol: "pipeline"                    # pipeline: multipart POST /ocr；openai: /v1/chat/completions
+    endpoint: "/ocr"
+    model: "paddleocr-pipeline"              # pipeline 由服务端选择 Layout + PaddleOCR-VL 模型
     timeout: 180                             # 单页识别超时 (秒)
+    max_tokens: 1024                         # 单页识别最大生成 token (须 < 模型上下文4096)
+  compare:
+    enabled: true
+    legacy_base_url: "http://192.168.0.201:8080"
+    legacy_model: "PaddleOCR-VL-1.6-0.9B"
+    legacy_protocol: "openai"
   dpi: 150                         # PDF 渲染 DPI (越大越清晰，越慢)
   max_image_dim: 3000              # 图片最大边长 (px)，超限自动缩放
   min_text_chars: 50               # 单页最少文本字符，低于此值触发 OCR
 
 # ===== 嵌入模型配置 =====
 embedding:
-  provider: "sentence_transformers"   # 本地 sentence_transformers (GPU)
-  model_name: "BAAI/bge-m3"
-  device: "cuda"
-  batch_size: 32
-  normalize: true
+  # 稠密向量继续调用 OpenAI 兼容 API (当前 Qwen3-Embedding-0.6B);
+  # BGE-M3 仅在本地 CPU 生成 lexical sparse weights，不替换稠密模型。
+  provider: "openai"
+  model_name: "BAAI/bge-m3"          # 仅 sentence_transformers provider 用
+  device: "cpu"                      # 仅 sentence_transformers provider 用
+  dimensions: 1024                   # 稠密向量维度 (Milvus schema 用, 须与 API 模型一致)
+  batch_size: 20                     # 每次 API 调用的批量大小
+  normalize: true                    # 对 API 返回的稠密向量做 L2 归一化
   max_length: 8192
-  # HuggingFace 镜像设置
-  hf_home: "E:/huggingface_cache"     # 模型缓存目录
-  hf_endpoint: "https://hf-mirror.com"  # 国内镜像，下载更快
+  # 稀疏向量来源: bge_m3 = 本地 BGE-M3 lexical weights (CPU);
+  #               none   = 纯稠密检索。BM25 另作为 corpus-aware 词法分支。
+  sparse_provider: "bge_m3"
+  sparse_model_name: "BAAI/bge-m3"
+  sparse_device: "cpu"
+  sparse_batch_size: 16
+  sparse_max_length: 512
+  # --- OpenAI 兼容 embedding API (provider=openai 时生效) ---
+  openai:
+    base_url: "https://api-inference.modelscope.cn/v1"   # 魔搭推理 API
+    model: "qwen/Qwen3-Embedding-0.6B"    # 1024维, 与 schema 一致; 8B 为 4096维 (需改库)
+    api_key: ""                 # 可直接填, 或用下方环境变量 (优先级更高)
+    api_key_env: "MODELSCOPE_API_KEY"   # 从环境变量读取 (优先级: env > api_key)
+    timeout: 60
+    max_retries: 3
+  # HuggingFace 镜像设置 (重排器等本地模型下载用)
+  # 注意: 用绝对路径 (main.py 启动时会强制 HF_HOME 指向此目录); E 盘不存在则改到项目内 data/
+  hf_home: "D:/git/RongNengRAG/data/hf_cache"     # 模型缓存目录
+  # hf_endpoint: 用 huggingface.co 直连 (hf-mirror 对 resolve/main 返回 308 重定向,
+  #   huggingface_hub 的 HEAD 请求不跟随导致下载失败; 本机直连 hf 可达)
+  hf_endpoint: "https://huggingface.co"
 
 # ===== 重排序器配置 =====
 reranker:
-  provider: "flagembedding"           # 本地 FlagEmbedding 交叉编码器 (GPU)
+  # provider: flagembedding = 本地交叉编码器精排 (CPU 可运行，首次请求下载模型)
+  #           none = 关闭模型重排, 仅元数据加权排序
+  provider: "flagembedding"
   model_name: "BAAI/bge-reranker-v2-m3"
-  device: "cuda"
-  batch_size: 16
+  device: "cpu"
+  batch_size: 8
   top_k: 15
+  none_rrf_weight: 0.15              # provider=none: rank prior vs retrieval score
+  max_metadata_boost: 1.20           # metadata may adjust, never dominate relevance
   metadata_boosts:
     exact_doc_number_match: 1.05      # 降低加权系数，避免过度加权
     file_name_match: 1.30             # 文件名匹配新增
     category_standard: 1.05
     publish_level_national: 1.05
+    domain_match: 1.05
+    voltage_level_match: 1.05
+    drawing_penalty: 0.90
 
 # ===== 检索配置 =====
 retrieval:
   coarse_top_k: 50         # Stage 1: hybrid search candidates
   fine_top_k: 15           # Stage 2: after reranking
+  max_chunks_per_file: 3   # allow multiple clauses per file without one file monopolising context
   rrf_k: 60                # Reciprocal Rank Fusion parameter
   dense_weight: 0.7        # Dense embedding weight in hybrid (标准规范语义更重要)
-  sparse_weight: 0.3       # Sparse lexical weight (关键词匹配降权，减少域间串扰)
+  sparse_weight: 0.3       # BGE-M3 sparse lexical weight in Milvus branch
+  bm25_enabled: true       # corpus-aware BM25 branch (IDF + document-length normalization)
+  bm25_weight: 0.25        # final vector/BM25 fusion weight
   nprobe: 16               # IVF index probe count
   confidence:              # 置信度校准
     min_score_threshold: 0.3
@@ -207,11 +262,12 @@ llm:
   provider: "openai"        # 仅支持 "openai" — 任意 OpenAI 兼容 /v1/chat/completions 服务
   openai:
     base_url: "http://192.168.0.201:18000/v1"   # vLLM / Xinference / PaddleX serving 等
-    model: "qwen2.5-7b-instruct"
+    model: "/data/models/Qwen/Qwen3-4B"   # vLLM 注册的完整模型 id
     api_key: ""             # 本地服务通常无需 key; 云服务填入真实 key
     api_key_env: "LLM_API_KEY"   # 优先从环境变量读取 (优先级: env > api_key)
     temperature: 0.1
     max_tokens: 4096
+    enable_thinking: false        # Qwen3/vLLM: 不输出 <think> 推理内容
 
 # ===== API配置 =====
 api:

@@ -16,11 +16,11 @@ FastAPI 后端服务 — RAG 知识库 API
 import sys
 import os
 
-# 强制离线模式 — BGE-M3 已缓存至 E:/huggingface_cache，禁止联网验证
-# (Windows 系统代理会拦截所有 HTTP 请求，代理客户端未启动时导致加载失败)
-os.environ["HF_HUB_OFFLINE"] = "1"
+# 注意: 已移除强制离线模式 — embedding 走魔搭 API, 但 BGE-Reranker 重排器
+# 需从 HF 镜像 (hf_endpoint) 下载 ~1.1GB 模型, 离线模式会导致其加载失败。
+# 模型下载到 embedding.hf_home 配置的缓存目录 (默认 D:/git/RongNengRAG/data/hf_cache)。
+# 若网络下载失败, 可临时恢复: os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
 # 绕过 Windows 系统代理 (127.0.0.1:7890)
 os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1,0.0.0.0,.local"
 os.environ["no_proxy"] = "localhost,127.0.0.1,::1,0.0.0.0,.local"
@@ -31,34 +31,84 @@ import time
 import faulthandler
 faulthandler.enable(file=sys.stderr, all_threads=True)
 import shutil
+from pathlib import Path
 from typing import Optional, List
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Form, Body, BackgroundTasks
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Form, Body, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ingestion.file_processor import FileProcessor, FileStatus, ProcessResult, BatchResult
+from ingestion.document_editor import (
+    LayoutEditError,
+    LayoutRevisionConflict,
+    layout_revision,
+)
 from retrieval.retriever import Retriever, SearchResponse, RetrievalResult
+from retrieval.cross_domain import retrieve_cross_domain
 from generation.llm_engine import LLMEngine
 from generation.conversation_manager import ConversationManager, beijing_now_display
+from config import load_config
+from api.security import (
+    ApiKeyAuthenticator,
+    AuthConfigurationError,
+    AuthenticationError,
+    cors_origins,
+)
+from api.upload_security import (
+    resolve_local_import_paths,
+    sanitize_upload_filename,
+    upload_destination,
+)
+from api.download_utils import download_filename, download_media_type
 
 # ==== 应用初始化 ====
+_runtime_config = load_config()
+_authenticator = ApiKeyAuthenticator.from_config(_runtime_config)
+_ALLOWED_UPLOAD_EXTS = {
+    ".pdf", ".doc", ".docx", ".wps", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".txt", ".md", ".ofd", ".jpg", ".jpeg", ".png", ".ceb",
+}
 app = FastAPI(
     title="RAG 知识库 API",
     description="模块化文件入库 + 智能问答系统",
     version="2.0.0",
 )
+app.state.authenticator = _authenticator
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=cors_origins(_runtime_config),
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
+    expose_headers=["X-Request-ID", "Content-Disposition", "Content-Type"],
+    allow_credentials=False,
 )
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    """Fail closed for every data endpoint; health and CORS preflight stay public."""
+    if request.method == "OPTIONS" or request.url.path == "/health":
+        return await call_next(request)
+    try:
+        request.state.principal = _authenticator.authenticate(
+            request.headers.get("authorization"),
+            request.headers.get("x-api-key"),
+        )
+    except AuthConfigurationError as exc:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+    except AuthenticationError as exc:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": str(exc)},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -66,6 +116,7 @@ async def startup():
     """启动时初始化数据目录 + 预热模型"""
     from config import ensure_data_dirs, load_config, get_project_root
     cfg = load_config()
+    _authenticator.ensure_configured()
     ensure_data_dirs(cfg)
 
     # 强制将所有缓存写到 E 盘，避免 C 盘被占满
@@ -171,6 +222,10 @@ def get_processor() -> FileProcessor:
     global _processor
     if _processor is None:
         _processor = FileProcessor()
+    # Keep writes and reads on the same Milvus client. Milvus Lite alias
+    # visibility is not reliable across independently-created clients.
+    if _retriever is not None and _retriever.store is not _processor.store:
+        _retriever.store = _processor.store
     return _processor
 
 
@@ -178,7 +233,23 @@ def get_retriever() -> Retriever:
     global _retriever
     if _retriever is None:
         _retriever = Retriever()
+    # FileProcessor is the owner of index-generation publication. Reuse its
+    # store whenever it already exists so reads observe the exact alias that
+    # the writer just activated.
+    if _processor is not None and _retriever.store is not _processor.store:
+        _retriever.store = _processor.store
     return _retriever
+
+
+def invalidate_retriever() -> None:
+    """Drop the cached Milvus client after an index generation changes.
+
+    FileProcessor and Retriever use separate Milvus clients. Milvus Lite can
+    retain the alias target per client, so a cached Retriever may keep reading
+    the previous generation after an atomic edit/reindex publish.
+    """
+    global _retriever
+    _retriever = None
 
 
 def get_llm():
@@ -221,6 +292,19 @@ class BatchUploadResponse(BaseModel):
     success_count: int
     failed_count: int
     results: List[UploadResponse]
+
+
+class LayoutEditOperation(BaseModel):
+    page_num: int = Field(..., ge=1)
+    block_index: int = Field(..., ge=0)
+    op: str = Field(default="update", pattern="^(update|delete)$")
+    content: str = Field(default="", max_length=65535)
+    content_format: str = Field(default="text", pattern="^(text|html)$")
+
+
+class DocumentEditRequest(BaseModel):
+    base_revision: str = Field(..., min_length=64, max_length=64)
+    edits: List[LayoutEditOperation] = Field(..., min_length=1, max_length=5000)
 
 
 class SearchRequest(BaseModel):
@@ -313,23 +397,19 @@ async def upload_file(
     processor = get_processor()
 
     # 检查文件类型
-    allowed_exts = {".pdf", ".doc", ".docx", ".wps", ".xls", ".xlsx", ".ppt", ".pptx",
-                    ".txt", ".md", ".ofd", ".jpg", ".jpeg", ".png", ".ceb"}
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in allowed_exts:
+    try:
+        safe_name = sanitize_upload_filename(file.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    ext = os.path.splitext(safe_name)[1].lower()
+    if ext not in _ALLOWED_UPLOAD_EXTS:
         raise HTTPException(
             status_code=400,
-            detail=f"不支持的文件类型 {ext}。支持: {', '.join(sorted(allowed_exts))}"
+            detail=f"不支持的文件类型 {ext}。支持: {', '.join(sorted(_ALLOWED_UPLOAD_EXTS))}"
         )
 
     # 保存到 uploads 目录
-    safe_name = file.filename.replace(" ", "_")
-    dest_path = os.path.join(str(processor.uploads_dir), safe_name)
-    # 避免覆盖
-    if os.path.exists(dest_path):
-        base, ext_part = os.path.splitext(safe_name)
-        dest_path = os.path.join(str(processor.uploads_dir),
-                                 f"{base}_{int(time.time())}{ext_part}")
+    dest_path = str(upload_destination(processor.uploads_dir, safe_name))
 
     try:
         with open(dest_path, "wb") as f:
@@ -344,6 +424,8 @@ async def upload_file(
         domain=domain,
         category=category,
     )
+    if result.status == FileStatus.COMPLETED:
+        invalidate_retriever()
 
     return UploadResponse(
         success=result.status == FileStatus.COMPLETED,
@@ -380,18 +462,22 @@ async def upload_files_batch(
     for file in files:
         if not file.filename:
             continue
-        safe_name = file.filename.replace(" ", "_")
-        dest_path = os.path.join(str(processor.uploads_dir), safe_name)
-        if os.path.exists(dest_path):
-            base, ext_part = os.path.splitext(safe_name)
-            dest_path = os.path.join(str(processor.uploads_dir),
-                                     f"{base}_{int(time.time())}{ext_part}")
+        try:
+            safe_name = sanitize_upload_filename(file.filename)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        ext = os.path.splitext(safe_name)[1].lower()
+        if ext not in _ALLOWED_UPLOAD_EXTS:
+            raise HTTPException(status_code=400, detail=f"不支持的文件类型 {ext}")
+        dest_path = str(upload_destination(processor.uploads_dir, safe_name))
         with open(dest_path, "wb") as f:
             content = await file.read()
             f.write(content)
         saved_paths.append(dest_path)
 
     batch_result = processor.process_batch(saved_paths, domain=domain, category=category)
+    if any(r.status == FileStatus.COMPLETED for r in batch_result.results):
+        invalidate_retriever()
 
     results = []
     for r in batch_result.results:
@@ -430,11 +516,32 @@ async def add_files_from_paths(
     用于服务端已有文件的情况
     """
     processor = get_processor()
-    valid_paths = [p for p in paths if os.path.exists(p)]
-    if not valid_paths:
-        raise HTTPException(status_code=400, detail="所有路径均不存在")
-
+    security = _runtime_config.get("security", {})
+    try:
+        valid_paths = resolve_local_import_paths(
+            paths,
+            security.get("local_path_import_roots", []),
+            bool(security.get("allow_local_path_import", False)),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    unsupported = [
+        path for path in valid_paths
+        if Path(path).suffix.lower() not in _ALLOWED_UPLOAD_EXTS
+    ]
+    if unsupported:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "本地导入包含不支持的文件类型: "
+                f"{Path(unsupported[0]).suffix}"
+            ),
+        )
     batch_result = processor.process_batch(valid_paths, domain=domain, category=category)
+    if any(r.status == FileStatus.COMPLETED for r in batch_result.results):
+        invalidate_retriever()
 
     results = []
     for r in batch_result.results:
@@ -473,7 +580,10 @@ async def get_files_summary():
 
 
 @app.get("/files/{identifier}/content")
-async def get_file_content(identifier: str):
+async def get_file_content(
+    identifier: str,
+    editable: bool = Query(default=False, description="返回可原位编辑的版面 HTML"),
+):
     """获取文件全部内容 (chunks + full_text)"""
     processor = get_processor()
     # 查找文件
@@ -486,26 +596,98 @@ async def get_file_content(identifier: str):
     if not match:
         raise HTTPException(status_code=404, detail="文件未找到")
 
-    r = get_retriever()
-    full_doc = r.get_full_document(
-        file_path=match.get("original_path") or match.get("file_name") or "",
-        file_hash=match.get("file_hash") or "",
-    )
-
-    # 拉 chunks 列表
+    # A persisted layout is sufficient for PDF preview.  Defer the vector
+    # lookup to the legacy fallback so a stale/unavailable index cannot block
+    # an already-published preview.
+    full_doc = ""
     chunks_raw = []
-    if match.get("file_hash"):
-        chunks_raw = r.store.query_by_file_hash(match["file_hash"], sort_by_page=True)
 
     chunks = []
-    pages = set()
-    for c in chunks_raw:
-        pages.add(getattr(c, "page_num", 0) or 0)
-        chunks.append({
-            "chunk_id": getattr(c, "chunk_id", ""),
-            "text": getattr(c, "text", ""),
-            "page_num": getattr(c, "page_num", 0) or 0,
-        })
+    from ingestion.vl_ocr import (
+        _clean_fragmentary_html,
+        _dedupe_markdown,
+        extract_layout_outline,
+        extract_text_outline,
+        render_layout_pages_html,
+    )
+    from ingestion.document_editor import layout_page_texts
+    layout_blocks = []
+    layout_pages = []
+    layout_cache = None
+    outline = []
+    current_layout_revision = ""
+    layout_path = Path(processor.config["paths"].get("parsed_cache", "data/parsed_cache")) / f"{match.get('file_hash')}.layout.json"
+    if layout_path.exists():
+        try:
+            layout_cache = json.loads(layout_path.read_text(encoding="utf-8"))
+            current_layout_revision = layout_revision(layout_cache)
+            layout_pages = render_layout_pages_html(layout_cache, editable=editable)
+            outline = extract_layout_outline(layout_cache)
+            if isinstance(layout_cache, dict):
+                flattened = []
+                for raw_page, blocks in layout_cache.items():
+                    try:
+                        page_num = int(raw_page) + 1
+                    except (TypeError, ValueError):
+                        continue
+                    for block in blocks if isinstance(blocks, list) else []:
+                        if isinstance(block, dict):
+                            flattened.append({**block, "page": page_num})
+                layout_blocks = flattened
+            elif isinstance(layout_cache, list):
+                layout_blocks = layout_cache
+        except (OSError, ValueError):
+            layout_blocks = []
+            layout_pages = []
+    # Use the same renderer as the live 8001 OCR comparison.  The frontend
+    # should display the persisted pipeline layout, not a second approximation
+    # of the same bbox/content data.
+    if not layout_pages and layout_blocks:
+        layout_pages = render_layout_pages_html(layout_blocks)
+    layout_html = layout_pages[0]["layout_html"] if len(layout_pages) == 1 else ""
+    if layout_cache is not None:
+        # The persisted layout and the edited vector generation are built from
+        # this exact page text.  Never append a Milvus read here: a stale
+        # client/alias would otherwise make preview show both the new layout
+        # and the old chunks after an edit.
+        current_page_texts = layout_page_texts(layout_cache)
+        chunks = [
+            {
+                "chunk_id": f"{match.get('file_hash')}_{page_num}",
+                "text": _dedupe_markdown(_clean_fragmentary_html(text)),
+                "page_num": page_num,
+            }
+            for page_num, text in current_page_texts
+            if str(text or "").strip()
+        ]
+        full_doc = "\n\n".join(
+            text.strip() for _, text in current_page_texts if str(text or "").strip()
+        )
+    else:
+        r = get_retriever()
+        full_doc = r.get_full_document(
+            file_path=match.get("original_path") or match.get("file_name") or "",
+            file_hash=match.get("file_hash") or "",
+        )
+        if match.get("file_hash"):
+            chunks_raw = r.store.query_by_file_hash(
+                match["file_hash"], sort_by_page=True
+            )
+        for c in chunks_raw:
+            # chunks_raw 来自 Milvus query, 是 dict 而非对象, 必须用 dict 访问
+            text = c.get("text", "") if isinstance(c, dict) else getattr(c, "text", "")
+            # 预览接口再做一次兼容性清洗：历史 chunk 或旧影子代中的异常
+            # OCR 片段不能因为未重新入库而继续污染页面展示。
+            text = _dedupe_markdown(_clean_fragmentary_html(text))
+            page_num = (c.get("page_num", 0) if isinstance(c, dict) else getattr(c, "page_num", 0)) or 0
+            chunks.append({
+                "chunk_id": c.get("chunk_id", "") if isinstance(c, dict) else getattr(c, "chunk_id", ""),
+                "text": text,
+                "page_num": page_num,
+            })
+    pages = {item["page_num"] for item in chunks}
+    if not outline:
+        outline = extract_text_outline(chunks, full_doc or "")
 
     return {
         "file_name": match.get("file_name") or "",
@@ -515,8 +697,169 @@ async def get_file_content(identifier: str):
         "doc_number": match.get("doc_number") or "",
         "full_text": full_doc or "",
         "chunks": chunks,
+        "layout_blocks": layout_blocks,
+        "layout_html": layout_html,
+        "layout_pages": layout_pages,
+        "layout_revision": current_layout_revision,
+        "editable": editable,
+        "outline": outline,
         "total_chunks": len(chunks),
-        "total_pages": len(pages),
+        "total_pages": max(
+            [page for page in pages if page > 0]
+            + [item["page_num"] for item in layout_pages],
+            default=1 if layout_pages else len(pages),
+        ),
+    }
+
+
+@app.put("/files/{identifier}/content")
+async def save_file_content(identifier: str, payload: DocumentEditRequest):
+    """Publish layout edits and rebuild this file's active vector chunks."""
+    processor = get_processor()
+    try:
+        result = processor.save_layout_edits(
+            identifier,
+            payload.base_revision,
+            [item.model_dump() for item in payload.edits],
+        )
+        invalidate_retriever()
+        return result
+    except LayoutRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LayoutEditError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/files/{identifier}/ocr-compare")
+async def compare_file_ocr(identifier: str):
+    """Run every source page through 8001 pipeline and 8080 bare VL OCR.
+
+    This is a preview diagnostic endpoint: it does not write vectors or alter
+    the active index. It reuses the configured OCR client protocols and returns
+    page-level results for side-by-side inspection in DocumentPreview.
+    """
+    processor = get_processor()
+    match = next(
+        (f for f in processor.list_files(limit=1000, check_existence=False, exclude_deleted=False)
+         if f.get("file_hash") == identifier or f.get("file_name") == identifier),
+        None,
+    )
+    if not match:
+        raise HTTPException(status_code=404, detail="文件未找到")
+    source = match.get("original_path") or match.get("stored_path") or ""
+    if not source or not os.path.exists(source):
+        raise HTTPException(status_code=404, detail="物理文件不存在")
+
+    from ingestion.vl_ocr import (
+        VLOcrClient,
+        extract_layout_outline,
+        render_layout_html,
+    )
+    cfg = load_config().get("ocr", {})
+    pipeline_cfg = cfg.get("vl", {})
+    compare_cfg = cfg.get("compare", {})
+    source_path = Path(source)
+    is_pdf = source_path.suffix.lower() == ".pdf"
+    pdf_page_count = 0
+    image_bytes = None
+    if is_pdf:
+        import fitz
+        with fitz.open(source) as doc:
+            if not doc.page_count:
+                raise HTTPException(status_code=422, detail="PDF 没有页面")
+            pdf_page_count = doc.page_count
+    else:
+        image_bytes = source_path.read_bytes()
+
+    pipeline = VLOcrClient(
+        base_url=pipeline_cfg.get("base_url", "http://127.0.0.1:8001"),
+        model=pipeline_cfg.get("model", "paddleocr-pipeline"),
+        timeout=int(pipeline_cfg.get("timeout", 180)),
+        dpi=int(cfg.get("dpi", 150)),
+        max_image_dim=int(cfg.get("max_image_dim", 3000)),
+        max_tokens=int(pipeline_cfg.get("max_tokens", 1024)),
+        protocol=pipeline_cfg.get("protocol", "pipeline"),
+        endpoint=pipeline_cfg.get("endpoint", "/ocr"),
+    )
+    legacy = VLOcrClient(
+        base_url=compare_cfg.get("legacy_base_url", "http://127.0.0.1:8080"),
+        model=compare_cfg.get("legacy_model", "PaddleOCR-VL-1.6-0.9B"),
+        timeout=int(pipeline_cfg.get("timeout", 180)),
+        dpi=int(cfg.get("dpi", 150)),
+        max_image_dim=int(cfg.get("max_image_dim", 3000)),
+        max_tokens=4096,
+        protocol=compare_cfg.get("legacy_protocol", "openai"),
+    )
+
+    def run(client):
+        try:
+            if is_pdf:
+                page_texts = client.recognize_pdf_pages(
+                    source,
+                    list(range(pdf_page_count)),
+                )
+                layout_by_page = getattr(client, "last_layout_pages", {}) or {}
+                page_results = []
+                all_blocks = []
+                text_parts = []
+                for page_idx in range(pdf_page_count):
+                    blocks = layout_by_page.get(page_idx)
+                    if blocks is None:
+                        blocks = layout_by_page.get(str(page_idx), [])
+                    blocks = blocks if isinstance(blocks, list) else []
+                    page_text = page_texts.get(page_idx, "") if isinstance(page_texts, dict) else ""
+                    page_html = render_layout_html(blocks, page_num=page_idx + 1)
+                    page_results.append({
+                        "page_num": page_idx + 1,
+                        "text": page_text or "",
+                        "layout_blocks": blocks,
+                        "layout_html": page_html,
+                    })
+                    all_blocks.extend(
+                        {**block, "page": page_idx + 1}
+                        for block in blocks
+                        if isinstance(block, dict)
+                    )
+                    if (page_text or "").strip():
+                        text_parts.append(f"--- 第 {page_idx + 1} 页 ---\n{page_text.strip()}")
+                return {
+                    "ok": True,
+                    "text": "\n\n".join(text_parts),
+                    "pages": page_results,
+                    "layout_blocks": all_blocks,
+                    "layout_html": page_results[0]["layout_html"] if pdf_page_count == 1 else "",
+                    "outline": extract_layout_outline({
+                        str(page_idx): blocks
+                        for page_idx, blocks in layout_by_page.items()
+                        if isinstance(blocks, list)
+                    }),
+                }
+
+            text = client.recognize_image(image_bytes or b"")
+            blocks = getattr(client, "last_layout_blocks", [])
+            page_html = render_layout_html(blocks, page_num=1)
+            return {
+                "ok": True,
+                "text": text,
+                "layout_blocks": blocks,
+                "layout_html": page_html,
+                "outline": extract_layout_outline(blocks),
+                "pages": [{
+                    "page_num": 1,
+                    "text": text or "",
+                    "layout_blocks": blocks,
+                    "layout_html": page_html,
+                }],
+            }
+        except Exception as exc:
+            return {"ok": False, "text": "", "pages": [], "error": str(exc)}
+
+    pipeline_result = run(pipeline)
+    return {
+        "file_name": match.get("file_name") or Path(source).name,
+        "file_hash": match.get("file_hash") or identifier,
+        "pipeline_8001": pipeline_result,
+        "bare_8080": run(legacy),
     }
 
 
@@ -551,6 +894,7 @@ async def delete_file(
     ok = processor.delete(identifier, remove_file=remove_file)
     if not ok:
         raise HTTPException(status_code=404, detail="文件未找到")
+    invalidate_retriever()
     return {"status": "deleted", "identifier": identifier}
 
 
@@ -564,19 +908,90 @@ async def update_file_meta(identifier: str, payload: dict = Body(...)):
     return result
 
 
+@app.post("/files/{identifier}/rebuild-preview-assets")
+async def rebuild_preview_assets(identifier: str):
+    """补建图表/图片预览资源，不重新 OCR、分块或写入向量。"""
+    processor = get_processor()
+    files = processor.list_files(limit=1000, check_existence=False, exclude_deleted=False)
+    match = next(
+        (item for item in files if item.get("file_hash") == identifier or item.get("file_name") == identifier),
+        None,
+    )
+    if not match:
+        raise HTTPException(status_code=404, detail="文件未找到")
+    source = match.get("original_path") or match.get("stored_path") or ""
+    if not source or not os.path.exists(source):
+        raise HTTPException(status_code=404, detail="物理文件不存在")
+    layout_path = (
+        Path(processor.config["paths"].get("parsed_cache", "data/parsed_cache"))
+        / f"{match.get('file_hash')}.layout.json"
+    )
+    if not layout_path.exists():
+        raise HTTPException(status_code=404, detail="版面缓存不存在，请先完成 OCR 解析")
+    try:
+        layout_cache = json.loads(layout_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"版面缓存无法读取: {exc}")
+
+    from ingestion.vl_ocr import VLOcrClient, _attach_visual_assets
+
+    ocr_cfg = load_config().get("ocr", {})
+    vl_cfg = ocr_cfg.get("vl", {})
+    client = VLOcrClient(
+        base_url=vl_cfg.get("base_url", "http://localhost:8080"),
+        model=vl_cfg.get("model", "paddleocr-vl-1.6"),
+        timeout=vl_cfg.get("timeout", 180),
+        dpi=ocr_cfg.get("dpi", 150),
+        max_image_dim=ocr_cfg.get("max_image_dim", 3000),
+        max_tokens=vl_cfg.get("max_tokens", 1024),
+        protocol=vl_cfg.get("protocol", "openai"),
+        endpoint=vl_cfg.get("endpoint", "/ocr"),
+    )
+    if Path(source).suffix.lower() == ".pdf" and isinstance(layout_cache, dict):
+        enriched = client.enrich_layout_pages_with_visual_assets(source, layout_cache)
+    elif isinstance(layout_cache, list):
+        enriched = _attach_visual_assets(Path(source).read_bytes(), layout_cache)
+    else:
+        enriched = layout_cache
+    temporary_path = layout_path.with_name(layout_path.name + ".tmp")
+    temporary_path.write_text(json.dumps(enriched, ensure_ascii=False), encoding="utf-8")
+    temporary_path.replace(layout_path)
+    edited_layout_path = layout_path.with_name(
+        f"{match.get('file_hash')}.layout.edited.json"
+    )
+    if edited_layout_path.exists():
+        edited_temporary = edited_layout_path.with_name(edited_layout_path.name + ".tmp")
+        edited_temporary.write_text(
+            json.dumps(enriched, ensure_ascii=False), encoding="utf-8"
+        )
+        edited_temporary.replace(edited_layout_path)
+    visual_count = sum(
+        1
+        for blocks in (enriched.values() if isinstance(enriched, dict) else [enriched])
+        for block in (blocks if isinstance(blocks, list) else [])
+        if isinstance(block, dict) and block.get("visual_data_uri")
+    )
+    return {
+        "success": True,
+        "file_hash": match.get("file_hash"),
+        "visual_assets": visual_count,
+        "message": "预览资源已补建，未重新 OCR、分块或写入向量",
+    }
+
+
 @app.get("/files/{identifier}/download")
 async def download_file(identifier: str):
     """下载原始文件"""
     from fastapi.responses import FileResponse
     processor = get_processor()
-    files = processor.list_files(limit=1, offset=0, check_existence=False, exclude_deleted=False)
     match = None
-    for f in files:
-        if f.get("file_hash") == identifier:
-            match = f
-            break
+    # Resolve by hash directly so downloads keep working even when the
+    # registry contains more than the first page of files.
+    resolved_hash = processor._resolve_hash(identifier)
+    if resolved_hash:
+        match = processor._get_registry(resolved_hash)
     if not match:
-        # fallback: search by filename
+        # Fallback for old/custom processors and filename substring requests.
         files2 = processor.list_files(limit=500, offset=0, check_existence=False, exclude_deleted=False)
         for f in files2:
             if identifier in (f.get("file_name") or ""):
@@ -587,8 +1002,9 @@ async def download_file(identifier: str):
     path = match.get("original_path") or match.get("stored_path") or ""
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="物理文件不存在")
-    fname = match.get("file_name") or "download"
-    return FileResponse(path, filename=fname, media_type="application/octet-stream")
+    fname = download_filename(match.get("file_name") or "", path)
+    media_type = download_media_type(fname, path)
+    return FileResponse(path, filename=fname, media_type=media_type)
 
 
 @app.post("/files/sync")
@@ -606,6 +1022,8 @@ async def sync_files(
     """
     processor = get_processor()
     result = processor.sync_orphans(dry_run=dry_run, check_milvus=check_milvus)
+    if not dry_run:
+        invalidate_retriever()
     return result
 
 
@@ -662,6 +1080,7 @@ async def recover_pending_files():
                 elapsed = result.total_time_ms
                 if result.status.value == "completed":
                     ok += 1
+                    invalidate_retriever()
                     done_data = json.dumps({
                         "event": "file_done", "file_name": fname,
                         "chunks": result.chunks_created, "chars": result.chars_extracted,
@@ -706,6 +1125,14 @@ async def reindex_file(identifier: str):
     """重建文件索引 (删除后重新解析+嵌入+入库)"""
     processor = get_processor()
     result = processor.reindex(identifier)
+    if result.status == FileStatus.COMPLETED:
+        invalidate_retriever()
+    print(
+        f"[reindex] identifier={identifier} file={result.file_name!r} "
+        f"status={result.status.value!r} success={result.status == FileStatus.COMPLETED} "
+        f"chunks={result.chunks_created} error={result.error_message!r}",
+        flush=True,
+    )
     return UploadResponse(
         success=result.status == FileStatus.COMPLETED,
         file_name=result.file_name,
@@ -919,9 +1346,20 @@ async def ask(req: AskRequest):
             sources=sources, elapsed_ms=(time.time() - t0) * 1000
         )
 
-    resp = r.search(query=req.query, top_k=req.top_k, domain_filter=req.domain_filter)
+    is_cross_domain = aq.query_type == "cross_domain_comparison"
+    context_domain1 = None
+    context_domain2 = None
+    if is_cross_domain:
+        resp = retrieve_cross_domain(r, req.query, req.top_k)
+        context = resp.context
+        context_domain1 = resp.context_domain1
+        context_domain2 = resp.context_domain2
+    else:
+        resp = r.search(
+            query=req.query, top_k=req.top_k, domain_filter=req.domain_filter
+        )
 
-    if not resp.results:
+    if not resp.results and not is_cross_domain:
         # 即使搜索无结果, 也尝试文件注册表: 用户可能提到了精确的文件名
         file_match = r.detect_file_in_query(req.query)
         if file_match:
@@ -951,7 +1389,7 @@ async def ask(req: AskRequest):
                 conv_mgr.add_message(req.conversation_id, "assistant", answer)
             return AskResponse(query=req.query, answer=answer, citations=[], sources=[],
                               elapsed_ms=(time.time() - t0) * 1000)
-    else:
+    elif not is_cross_domain:
         context, file_match = r.build_context_with_file_injection(
             query=req.query, search_results=resp.results, max_chunks=req.top_k
         )
@@ -967,7 +1405,7 @@ async def ask(req: AskRequest):
             history_msgs = conv_mgr.get_context_messages(req.conversation_id)
 
             # 构建消息列表: 系统提示 + 历史 + 当前检索上下文
-            from generation.prompt_templates import get_system_prompt
+            from generation.prompt_templates import get_prompt, get_system_prompt
             messages = [{"role": "system", "content": get_system_prompt(resp.query_type)}]
 
             # 添加历史消息 (不包含刚添加的用户消息的最后一条)
@@ -977,13 +1415,19 @@ async def ask(req: AskRequest):
             # 最后一条用户消息附带检索上下文
             messages.append({
                 "role": "user",
-                "content": f"{context}\n\n用户问题: {req.query}\n\n请根据以上文件内容回答:"
+                "content": get_prompt(
+                    resp.query_type,
+                    context,
+                    req.query,
+                    context_domain1,
+                    context_domain2,
+                ),
             })
 
             answer = llm.generate_chat(messages, temperature=0.1)
             citations = llm.extract_citations(answer)
         except Exception as e:
-            answer = f"⚠ LLM 不可用: {e}\n\n检索到 {resp.total_candidates} 条"
+            answer = f"⚠ 回答生成失败 ({type(e).__name__}): {e}\n\n检索到 {resp.total_candidates} 条"
             citations = []
 
         # 记录助手回复
@@ -991,11 +1435,16 @@ async def ask(req: AskRequest):
 
     elif llm:
         try:
-            answer = llm.generate_rag_answer(query=req.query, context=context,
-                                            query_type=resp.query_type)
+            answer = llm.generate_rag_answer(
+                query=req.query,
+                context=context,
+                query_type=resp.query_type,
+                context_domain1=context_domain1,
+                context_domain2=context_domain2,
+            )
             citations = llm.extract_citations(answer)
         except Exception as e:
-            answer = f"⚠ LLM 不可用: {e}\n\n检索到 {resp.total_candidates} 条"
+            answer = f"⚠ 回答生成失败 ({type(e).__name__}): {e}\n\n检索到 {resp.total_candidates} 条"
             citations = []
     else:
         answer = "⚠ LLM 服务不可用。请检查 LLM 服务配置。\n\n## 检索到的资料\n"
@@ -1065,9 +1514,20 @@ async def ask_stream(req: AskRequest):
                 conv_mgr.add_message(req.conversation_id, "assistant", full_answer, citations=citations)
             return
 
-        resp = r.search(query=req.query, top_k=req.top_k, domain_filter=req.domain_filter)
+        is_cross_domain = aq.query_type == "cross_domain_comparison"
+        context_domain1 = None
+        context_domain2 = None
+        if is_cross_domain:
+            resp = retrieve_cross_domain(r, req.query, req.top_k)
+            context = resp.context
+            context_domain1 = resp.context_domain1
+            context_domain2 = resp.context_domain2
+        else:
+            resp = r.search(
+                query=req.query, top_k=req.top_k, domain_filter=req.domain_filter
+            )
 
-        if not resp.results:
+        if not resp.results and not is_cross_domain:
             file_match = r.detect_file_in_query(req.query)
             if file_match:
                 file_path = (file_match.entry.original_path or
@@ -1086,7 +1546,7 @@ async def ask_stream(req: AskRequest):
             else:
                 yield f"data: {json.dumps({'token': '未找到相关内容', 'done': True, 'citations': [], 'sources': [], 'elapsed_ms': (time.time() - t0) * 1000})}\n\n"
                 return
-        else:
+        elif not is_cross_domain:
             context, file_match = r.build_context_with_file_injection(
                 query=req.query, search_results=resp.results, max_chunks=req.top_k
             )
@@ -1121,14 +1581,20 @@ async def ask_stream(req: AskRequest):
                 conv_mgr = get_conv_mgr()
                 conv_mgr.add_message(req.conversation_id, "user", req.query)
 
-                from generation.prompt_templates import get_system_prompt
+                from generation.prompt_templates import get_prompt, get_system_prompt
                 history_msgs = conv_mgr.get_context_messages(req.conversation_id)
                 messages = [{"role": "system", "content": get_system_prompt(resp.query_type)}]
                 for hm in history_msgs[:-1]:
                     messages.append(hm)
                 messages.append({
                     "role": "user",
-                    "content": f"{context}\n\n用户问题: {req.query}\n\n请根据以上文件内容回答:"
+                    "content": get_prompt(
+                        resp.query_type,
+                        context,
+                        req.query,
+                        context_domain1,
+                        context_domain2,
+                    ),
                 })
 
                 full_answer = ""
@@ -1145,7 +1611,11 @@ async def ask_stream(req: AskRequest):
             else:
                 full_answer = ""
                 for token in llm.generate_rag_answer_stream(
-                    query=req.query, context=context, query_type=resp.query_type
+                    query=req.query,
+                    context=context,
+                    query_type=resp.query_type,
+                    context_domain1=context_domain1,
+                    context_domain2=context_domain2,
                 ):
                     full_answer += token
                     yield f"data: {json.dumps({'token': token, 'done': False})}\n\n"
@@ -1155,7 +1625,8 @@ async def ask_stream(req: AskRequest):
                 yield f"data: {json.dumps({'token': '', 'done': True, 'citations': citations, 'sources': cited_sources, 'elapsed_ms': (time.time() - t0) * 1000, 'full_answer': full_answer})}\n\n"
 
         except Exception as e:
-            yield f"data: {json.dumps({'token': f'⚠ 错误: {e}', 'done': True})}\n\n"
+            message = f"⚠ 回答生成失败 ({type(e).__name__}): {e}"
+            yield f"data: {json.dumps({'token': message, 'done': True})}\n\n"
 
     return StreamingResponse(
         generate(),
@@ -1220,6 +1691,12 @@ async def delete_conversation(conv_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="会话不存在")
     return {"status": "deleted", "conv_id": conv_id}
+
+
+# ===== Excel 工作簿微服务代理 (新增, 不影响现有路由) =====
+from .excel_proxy import excel_router as _excel_router
+
+app.include_router(_excel_router)
 
 
 if __name__ == "__main__":

@@ -376,12 +376,30 @@ class Chunker:
 
     def _force_split(self, text: str, max_chars: int, overlap: int) -> List[str]:
         """强制按最大字符数拆分"""
+        if max_chars <= 0:
+            raise ValueError("max_chars must be greater than zero")
+
+        # overlap 仅用于回带上一块的尾部，不能阻止游标前进。
+        # 即使配置误将 overlap 设为不小于 max_chars，也保证
+        # next_start > start，避免导入任务永久卡住。
+        safe_overlap = min(max(overlap, 0), max_chars - 1)
         chunks = []
         start = 0
         while start < len(text):
             end = min(start + max_chars, len(text))
             chunks.append(text[start:end])
-            start = end - overlap
+
+            # 末块已消费完全文，必须直接结束；否则 overlap
+            # 会将 start 拉回正文末尾之前，不断重复产生最后一块。
+            if end >= len(text):
+                break
+
+            next_start = end - safe_overlap
+            if next_start <= start:
+                # 理论上 safe_overlap 已保证不会到达此分支；
+                # 保留运行时安全阀，防止未来算法修改重新引入死循环。
+                next_start = start + 1
+            start = next_start
         return chunks
 
 

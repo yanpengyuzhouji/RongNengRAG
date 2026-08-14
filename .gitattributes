@@ -1,0 +1,25 @@
+# Keep source and documentation deterministic across Windows/WSL/Linux.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.7z binary
+*.db binary
+*.doc binary
+*.docx binary
+*.gif binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.milvus binary
+*.onnx binary
+*.pdf binary
+*.png binary
+*.sqlite binary
+*.tar binary
+*.xls binary
+*.xlsm binary
+*.xlsx binary
+*.zip binary

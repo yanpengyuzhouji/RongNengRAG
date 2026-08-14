@@ -75,7 +75,7 @@
         <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
-            <el-button link type="primary" size="small" @click="API.downloadFile(row.file_hash)">下载</el-button>
+            <el-button link type="primary" size="small" @click="handleDownload(row)">下载</el-button>
             <el-button link type="success" size="small" @click="$emit('preview', row)">预览</el-button>
             <el-button v-if="row.status === 'failed'" link type="warning" size="small" @click="handleReindex(row)">重解析</el-button>
             <el-button v-if="row.status !== 'pending'" link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
@@ -393,6 +393,14 @@ function retryUpload(i) {
 }
 
 // ════════ Row actions ════════
+async function handleDownload(row) {
+  try {
+    await API.downloadFile(row.file_hash, row.file_name)
+  } catch (error) {
+    ElMessage.error('下载失败: ' + (error?.message || error))
+  }
+}
+
 async function handleDelete(row) {
   try {
     await ElMessageBox.confirm(`确定删除 "${row.file_name}"？`, '确认删除', {
@@ -408,15 +416,24 @@ async function handleDelete(row) {
 
 async function handleReindex(row) {
   loading.value = true
-  const res = await API.api('POST', `/files/${encodeURIComponent(row.file_hash)}/reindex`)
-  loading.value = false
-  if (typeof res === 'string') { ElMessage.error('重解析失败: ' + res); return }
-  if (res.success) {
-    ElMessage.success(`重解析完成: ${res.chunks_created} 片段`)
-    fetchData()
-    fetchSummary()
-  } else {
-    ElMessage.warning(res.status || '失败')
+  try {
+    const res = await API.api('POST', `/files/${encodeURIComponent(row.file_hash)}/reindex`)
+    if (typeof res === 'string') { ElMessage.error('重解析失败: ' + res); return }
+    // 以明确的 completed 状态为成功依据；兼容旧后端未返回 success 的情况。
+    if (res.success === true || res.status === 'completed') {
+      row.status = 'completed'
+      row.chunks_count = res.chunks_created ?? row.chunks_count
+      row.error_message = ''
+      ElMessage.success(`重解析完成: ${res.chunks_created || 0} 片段`)
+      await fetchData()
+      await fetchSummary()
+    } else {
+      ElMessage.warning(res.error_message || res.status || '失败')
+    }
+  } catch (error) {
+    ElMessage.error(`重解析失败: ${error?.message || error}`)
+  } finally {
+    loading.value = false
   }
 }
 
