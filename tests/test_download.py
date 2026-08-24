@@ -12,6 +12,7 @@ class DownloadFormatTests(unittest.TestCase):
         )
         self.assertEqual("image/png", download_media_type("截图.png"))
         self.assertEqual("text/markdown", download_media_type("说明.md"))
+        self.assertEqual("application/x-ceb", download_media_type("通知.ceb"))
 
     def test_unknown_extension_uses_safe_binary_fallback(self):
         self.assertEqual("application/octet-stream", download_media_type("file.unknown"))

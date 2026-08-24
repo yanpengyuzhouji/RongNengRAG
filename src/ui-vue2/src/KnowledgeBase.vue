@@ -122,7 +122,7 @@
         </div>
       </div>
       <input ref="fileInputRef" type="file" multiple hidden
-        accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.wps,.ofd,.txt,.md,.jpg,.jpeg,.png"
+        accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.wps,.ofd,.ceb,.txt,.md,.jpg,.jpeg,.png"
         @change="onFilesSelected" />
 
       <!-- Directory selectors -->
@@ -144,6 +144,7 @@
             <el-option label="Excel" value=".xlsx" />
             <el-option label="PPT" value=".pptx" />
             <el-option label="OFD" value=".ofd" />
+            <el-option label="CEB" value=".ceb" />
             <el-option label="图片" value="image" />
           </el-select>
         </div>
@@ -480,6 +481,7 @@ const iconMap = {
   '.ppt': 'https://cdn-icons-png.flaticon.com/128/888/888074.png',
   '.pptx': 'https://cdn-icons-png.flaticon.com/128/888/888074.png',
   '.ofd': 'https://cdn-icons-png.flaticon.com/128/4823/4823522.png',
+  '.ceb': 'https://cdn-icons-png.flaticon.com/128/281/281760.png',
   '.wps': 'https://cdn-icons-png.flaticon.com/128/281/281760.png',
 }
 function fileIcon(ft) { return iconMap[ft] || iconMap['.pdf'] }

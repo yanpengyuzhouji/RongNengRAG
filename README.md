@@ -39,7 +39,7 @@ python run.py            # 127.0.0.1:8090
                                     └───────────────┘
 ```
 
-- **文档解析**：PyMuPDF 提取文字 PDF；扫描件、PNG/JPEG 等图片通过外部 **PaddleOCR-VL** 服务结构化识别（阅读顺序 + Markdown 表格 + 标题层级 + bbox），按页或单图入库。
+- **文档解析**：PDF、CEB 和 PNG/JPEG 等页面通过外部 **PaddleOCR-VL** 服务结构化识别（阅读顺序 + Markdown 表格 + 标题层级 + bbox），CEB 使用 Apabi 原生渲染为多页 PNG，不经过 PDF。
 - **混合检索**：稠密向量继续使用 ModelScope 的 `Qwen3-Embedding-0.6B`；稀疏向量由本地 CPU `BGE-M3` 生成并写入 Milvus；另有带语料 IDF 和文档长度归一化的 BM25 关键词分支，最终经过本地 CPU `BGE-Reranker-v2-m3` 重排。
 - **LLM 生成**：调用任意 **OpenAI 兼容** 的 `/v1/chat/completions` 服务（vLLM / Xinference / LM Studio / PaddleX serving 等），无需本地部署模型。
 - **前端**：Vue 3 + Element Plus（`src/ui-vue2`，默认 5174 端口）。
@@ -91,6 +91,13 @@ ocr:
   compare:
     legacy_base_url: "http://<兼容 OCR 服务地址>" # 可选，如 192.168.0.201:8080
 
+ceb:
+  enabled: true
+  renderer_script: "scripts/ceb_render_pages.ps1"
+  apabi_dir: "D:/Apabi reader"
+  render_width: 800
+  render_height: 1000
+
 embedding:
   provider: "openai"                         # Qwen dense API
   dimensions: 1024
@@ -129,14 +136,14 @@ API 文档：http://localhost:8000/docs
 ```bash
 cd src/ui-vue2
 npm install
-npm run dev        # 默认 http://localhost:5174
+npm run dev -- --host 0.0.0.0  # 局域网访问：http://<服务器局域网IP>:5174
 ```
 
 若后端不在本机，指定后端地址：
 
 ```bash
-npm run dev -- --host     # 或用环境变量
-VITE_API_BASE=http://192.168.x.x:8000 npm run dev
+npm run dev -- --host 0.0.0.0     # 或用环境变量
+VITE_API_BASE=http://192.168.x.x:8000 npm run dev -- --host 0.0.0.0
 ```
 
 ### 5. 入库文档
@@ -179,7 +186,8 @@ config.yaml                # 全局配置 (LLM / OCR / 分块 / 检索)
 src/
   api/main.py              # FastAPI 后端
   ingestion/               # 文档解析 + 分块 + 嵌入
-    pdf_parser.py          # PDF 解析 (fitz)
+    pdf_parser.py          # PDF 页面解析与 OCR 调度
+    ceb_renderer.py        # Apabi CEB 原生分页 PNG 渲染适配
     vl_ocr.py              # PaddleOCR-VL 协议适配、版面渲染、目录提取
     chunker.py             # 分块引擎 (按页分块, 保留页码)
     embedder.py            # Qwen 稠密 API + 本地 BGE-M3 稀疏向量

@@ -345,6 +345,18 @@ export function queryWorkbook(workbookId, sql, maxRows = 200) {
   })
 }
 
+export function listWorkbookConversations(workbookId) {
+  return api('GET', `/excel/workbooks/${workbookId}/conversations`)
+}
+
+export function getWorkbookConversation(workbookId, convId) {
+  return api('GET', `/excel/workbooks/${workbookId}/conversations/${encodeURIComponent(convId)}`)
+}
+
+export function deleteWorkbookConversation(workbookId, convId) {
+  return api('DELETE', `/excel/workbooks/${workbookId}/conversations/${encodeURIComponent(convId)}`)
+}
+
 /** Returns { promise, controller } for SSE consumption */
 export function askWorkbookStream(workbookId, question, maxRows = 200, convId = null) {
   const controller = new AbortController()
@@ -362,7 +374,7 @@ export function askWorkbookStream(workbookId, question, maxRows = 200, convId = 
 }
 
 export function workbookReportUrl(workbookId, reportId) {
-  return `${BASE}/excel/workbooks/${workbookId}/reports/${reportId}`
+  return `${BASE}/excel/workbooks/${encodeURIComponent(workbookId)}/reports/${encodeURIComponent(reportId)}`
 }
 
 export async function fetchWorkbookReport(workbookId, reportId, signal) {

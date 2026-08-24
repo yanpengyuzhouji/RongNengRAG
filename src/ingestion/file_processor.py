@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ingestion.pdf_parser import PDFParser
+from ingestion.ceb_renderer import CEBRenderer
 from ingestion.chunker import Chunker, Chunk
 from ingestion.embedder import Embedder, create_text_for_embedding
 from ingestion.milvus_store import MilvusStore
@@ -111,6 +112,7 @@ class FileProcessor:
             min_text_chars=ocr_cfg.get("min_text_chars", 50),
             ocr_config=ocr_cfg,
         )
+        self.ceb_renderer = CEBRenderer(self.config)
         self.chunker = Chunker(config_path)
         self.embedder = None  # 延迟加载
         self.store = MilvusStore(config_path)
@@ -271,7 +273,7 @@ class FileProcessor:
             # 已完成，也必须重新走 8001 pipeline 才能补齐版面数据。
             layout_cache = Path(self.config["paths"].get("parsed_cache", "data/parsed_cache")) / f"{file_hash}.layout.json"
             needs_layout_rebuild = (
-                file_ext in (".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif")
+                file_ext in (".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif", ".ceb")
                 and self.config.get("ocr", {}).get("enabled", False)
                 and not layout_cache.exists()
             )
@@ -320,6 +322,17 @@ class FileProcessor:
                 explicit_category=category,
             )
             file_ext_lower = file_meta.get("extension", "").lower()
+
+            # CEB uses the native Apabi renderer to produce one PNG per page.
+            # From this point on it follows the same page OCR -> layout cache
+            # -> chunk -> staged vector path as PDF/image documents.
+            if file_ext_lower == ".ceb":
+                ceb_result = self._process_ceb_png(
+                    file_path, file_meta, file_hash, file_name,
+                    file_size, file_ext, result, progress_callback,
+                    preserve_existing=preserve_existing,
+                )
+                return ceb_result
 
             # PDF + OCR 场景: 渐进入库，避免全部OCR完才嵌入
             if file_ext_lower == ".pdf" and not file_meta.get("is_drawing"):
@@ -473,6 +486,12 @@ class FileProcessor:
             cache_paths.extend(cache_dir.glob(f".{file_hash}.layout*.restore"))
             for cache_path in cache_paths:
                 cache_path.unlink(missing_ok=True)
+
+            # CEB native page PNGs are derived assets keyed by the original
+            # content hash and are no longer needed after deletion.
+            ceb_renderer = getattr(self, "ceb_renderer", None)
+            if ceb_renderer is not None:
+                ceb_renderer.cleanup(file_hash)
 
             # 清理物理文件（安全策略：仅删除 uploads 目录下的文件）
             if remove_file and reg:
@@ -671,7 +690,7 @@ class FileProcessor:
                           edits: list) -> dict:
         """Publish preview edits to layout cache and Milvus as one operation.
 
-        The original PDF/image remains immutable.  A staged Milvus generation
+        The original PDF/image/CEB remains immutable.  A staged Milvus generation
         is validated before publication; cache files and the active alias are
         compensated back to their previous versions if any publish step fails.
         """
@@ -1064,6 +1083,144 @@ class FileProcessor:
 
         conn.commit()
         conn.close()
+
+    def _process_ceb_png(self, file_path, file_meta, file_hash, file_name,
+                         file_size, file_ext, result: ProcessResult,
+                         progress_callback=None,
+                         preserve_existing: bool = False) -> ProcessResult:
+        """Render CEB pages natively, OCR each PNG, then use the common path.
+
+        CEB has no PDF intermediate in this path.  The renderer's page PNG is
+        the exact image sent to PaddleOCR-VL, and the returned layout blocks
+        are persisted using the same zero-based page dictionary used by the
+        existing PDF pipeline.  This keeps preview, outline and editing
+        semantics identical across formats.
+        """
+        t_start = time.time()
+        cache_dir = Path(self.config["paths"].get("parsed_cache", "data/parsed_cache"))
+        layout_path = cache_dir / f"{file_hash}.layout.json"
+        edited_layout_path = cache_dir / f"{file_hash}.layout.edited.json"
+
+        from ingestion.vl_ocr import is_garbage_ocr_text
+
+        # A published edit is the source of truth.  Do not silently rerender
+        # CEB and overwrite the user's corrected text on reindex.
+        if edited_layout_path.exists():
+            try:
+                edited_layout = json.loads(
+                    edited_layout_path.read_text(encoding="utf-8")
+                )
+                page_texts = list(layout_page_texts(edited_layout))
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                layout_path.write_text(
+                    json.dumps(edited_layout, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                total_pages = max((page for page, _ in page_texts), default=1)
+                all_chunks = []
+                for page_num, text in page_texts:
+                    if text.strip():
+                        all_chunks.extend(self.chunker.chunk_page_text(
+                            text, page_num, total_pages, file_meta
+                        ))
+                print(
+                    f"   [EDIT] CEB 重新入库保留已发布版面，共 {total_pages} 页",
+                    flush=True,
+                )
+                return self._finish_page_chunks(
+                    all_chunks, result, file_meta, file_hash, file_name,
+                    file_path, file_size, file_ext, t_start,
+                    progress_callback, preserve_existing,
+                    empty_error="CEB 编辑版面无有效文本内容",
+                )
+            except (OSError, ValueError, LayoutEditError) as exc:
+                raise RuntimeError(f"已编辑 CEB 版面缓存损坏，拒绝覆盖: {exc}") from exc
+
+        renderer = getattr(self, "ceb_renderer", None)
+        if renderer is None:
+            renderer = CEBRenderer(self.config)
+            self.ceb_renderer = renderer
+        if progress_callback:
+            progress_callback("CEB页面渲染", 0.05)
+        rendered = renderer.render(file_path, file_hash)
+        page_count = rendered.page_count
+        print(f"   [CEB] Apabi 原生渲染完成，共 {page_count} 页", flush=True)
+
+        if progress_callback:
+            progress_callback(f"CEB OCR识别 ({page_count}页)", 0.1)
+
+        layout_pages = {}
+        all_chunks = []
+        for index, page_path in enumerate(rendered.page_paths):
+            page_num = index + 1
+            layout_pages[str(index)] = []
+            try:
+                text, blocks = self.pdf_parser.ocr_page_with_layout(str(page_path))
+                layout_pages[str(index)] = blocks or []
+                text = (text or "").strip()
+                if text and is_garbage_ocr_text(text):
+                    print(f"   [CEB OCR] 第{page_num}页疑似垃圾识别，已跳过入库文本")
+                    text = ""
+                if text:
+                    all_chunks.extend(self.chunker.chunk_page_text(
+                        text, page_num, page_count, file_meta
+                    ))
+            except Exception as exc:
+                # Keep the page in layout cache even when one OCR request
+                # fails; the document can still be searched by other pages.
+                print(f"   [CEB OCR] 第{page_num}页识别失败: {exc}", flush=True)
+            if progress_callback:
+                progress_callback(
+                    f"CEB OCR识别 ({page_num}/{page_count})",
+                    0.1 + 0.4 * page_num / max(page_count, 1),
+                )
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        layout_path.write_text(
+            json.dumps(layout_pages, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(
+            f"   [CEB OCR] 已缓存 {len(layout_pages)} 页版面块: {layout_path.name}",
+            flush=True,
+        )
+        return self._finish_page_chunks(
+            all_chunks, result, file_meta, file_hash, file_name,
+            file_path, file_size, file_ext, t_start,
+            progress_callback, preserve_existing,
+            empty_error="CEB 逐页 OCR 后无有效文本内容",
+        )
+
+    def _finish_page_chunks(self, chunks, result: ProcessResult, file_meta,
+                            file_hash, file_name, file_path, file_size,
+                            file_ext, t_start, progress_callback,
+                            preserve_existing: bool,
+                            empty_error: str) -> ProcessResult:
+        """Set page parse statistics and continue through staged embedding."""
+        result.chunks_created = len(chunks)
+        result.chars_extracted = sum(c.char_count for c in chunks)
+        result.domain = file_meta.get("domain", "")
+        result.category = file_meta.get("category", "")
+        result.doc_number = file_meta.get("doc_number", "")
+        result.parse_time_ms = (time.time() - t_start) * 1000
+
+        if not chunks:
+            result.status = FileStatus.FAILED
+            result.error_message = empty_error
+            if not preserve_existing:
+                self._upsert_registry(
+                    file_hash, file_name, file_path, file_size,
+                    file_ext, status="failed", error=result.error_message,
+                )
+            return result
+
+        if progress_callback:
+            progress_callback("解析文件", 1.0)
+            progress_callback("生成嵌入向量", 0.0)
+        return self._embed_and_insert(
+            chunks, result, file_hash, file_name, file_path,
+            file_size, file_ext, t_start, progress_callback,
+        )
 
     def _process_pdf_progressive(self, file_path, file_meta, file_hash, file_name,
                                   file_size, file_ext, result: ProcessResult,

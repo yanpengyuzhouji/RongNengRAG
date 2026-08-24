@@ -12,8 +12,11 @@ security:
   local_path_import_roots: []
   cors_origins:
     - "http://192.168.0.7:5174"
+    - "http://192.168.0.7:5173"
     - "http://localhost:5174"
+    - "http://localhost:5173"
     - "http://127.0.0.1:5174"
+    - "http://127.0.0.1:5173"
 
 # ===== 路径配置 =====
 # 所有路径相对于项目根目录 (config.yaml 所在目录)
@@ -23,6 +26,7 @@ paths:
   metadata_db: "data/file_metadata.db"         # SQLite 文件注册表
   milvus_db: "data/milvus_lite.db"             # Milvus Lite 向量数据库
   parsed_cache: "data/parsed_cache"            # 解析缓存
+  ceb_rendered: "data/ceb_pages"               # CEB 原生分页 PNG 派生缓存
   uploads_dir: "data/uploads"                  # 上传文件暂存
   models_dir: "data/models"                    # 本地模型文件
 
@@ -168,7 +172,18 @@ chunking:
   full_document:
     max_chars_for_full: 1500  # <1500字符的短文档不拆分
 
-# ===== OCR 配置 (扫描件 PDF 识别 — 外部 PaddleOCR-VL 服务) =====
+# ===== CEB 配置 (原生 Apabi 32 位 ActiveX → 多页 PNG，不经过 PDF) =====
+ceb:
+  enabled: true
+  renderer_script: "scripts/ceb_render_pages.ps1"
+  apabi_dir: "D:\\Apabi reader"
+  powershell: "powershell.exe"
+  powershell32: "C:\\Windows\\SysWOW64\\WindowsPowerShell\\v1.0\\powershell.exe"
+  render_width: 800
+  render_height: 1000
+  timeout: 300
+
+# ===== OCR 配置 (扫描件 PDF/CEB 页面识别 — 外部 PaddleOCR-VL 服务) =====
 ocr:
   enabled: true                    # 是否启用 OCR (扫描件识别)
   always_pipeline: true            # 上传解析统一走 8001 Pipeline，保留版面块；失败时回退原文

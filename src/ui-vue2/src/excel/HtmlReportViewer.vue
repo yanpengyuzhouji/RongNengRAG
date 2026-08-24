@@ -1,18 +1,27 @@
 <template>
   <div class="html-report-viewer">
-    <div v-if="title" class="report-bar">
-      <span class="report-title">{{ title }}</span>
-      <el-button size="small" text @click="openNew">新窗口打开 ↗</el-button>
-    </div>
     <iframe
       v-if="url"
+      ref="reportFrame"
       :src="url"
       class="report-frame"
       loading="lazy"
-      sandbox
+      sandbox="allow-modals"
       referrerpolicy="no-referrer"
       @load="loaded = true"
     ></iframe>
+    <div v-if="url && loaded" class="report-actions">
+      <el-button
+        type="primary"
+        size="small"
+        :loading="printing"
+        aria-label="下载 PDF"
+        @click="downloadPdf"
+      >
+        <span aria-hidden="true">↓</span>
+        下载 PDF
+      </el-button>
+    </div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
     <el-empty v-else-if="!loaded" description="报告加载中…" class="report-empty" />
   </div>
@@ -31,6 +40,8 @@ const props = defineProps({
 const loaded = ref(false)
 const error = ref('')
 const url = ref('')
+const printing = ref(false)
+const reportFrame = ref(null)
 const controller = new AbortController()
 
 onMounted(async () => {
@@ -49,40 +60,68 @@ onBeforeUnmount(() => {
   if (url.value) URL.revokeObjectURL(url.value)
 })
 
-function openNew() {
-  if (!url.value) return
-  const reportWindow = window.open(url.value, '_blank', 'noopener,noreferrer')
-  if (reportWindow) reportWindow.opener = null
+function downloadPdf() {
+  const frameWindow = reportFrame.value?.contentWindow
+  if (!frameWindow || !loaded.value) return
+
+  printing.value = true
+  try {
+    // Browsers expose "Save as PDF" from the print dialog.  Printing the
+    // iframe keeps the report itself as the only page content and avoids
+    // opening an untrusted report in a new top-level window.
+    frameWindow.focus()
+    frameWindow.print()
+  } catch (err) {
+    error.value = err?.message || '无法打开 PDF 下载窗口'
+  } finally {
+    // print() is asynchronous when a dialog is shown; this only controls the
+    // short visual loading state of the button.
+    window.setTimeout(() => { printing.value = false }, 300)
+  }
 }
 </script>
 
 <style scoped>
 .html-report-viewer {
+  position: relative;
   border: 1px solid #e4e7ed;
   border-radius: 8px;
   overflow: hidden;
   margin: 8px 0;
-}
-.report-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 12px;
-  background: #f5f7fa;
-  border-bottom: 1px solid #e4e7ed;
-  font-size: 13px;
-}
-.report-title {
-  font-weight: 600;
-  color: #303133;
+  background: #fff;
 }
 .report-frame {
   width: 100%;
-  height: 420px;
+  height: 620px;
   border: none;
   display: block;
+  background: #fff;
+}
+.report-actions {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  padding: 4px;
+  border-radius: 8px;
+  background: rgb(255 255 255 / 88%);
+  box-shadow: 0 2px 10px rgb(15 23 42 / 16%);
+  backdrop-filter: blur(4px);
 }
 .report-empty {
   padding: 24px 0;
+}
+
+@media (max-width: 768px) {
+  .report-frame {
+    height: 520px;
+  }
+
+  .report-actions {
+    right: 10px;
+    bottom: 10px;
+  }
 }
 </style>

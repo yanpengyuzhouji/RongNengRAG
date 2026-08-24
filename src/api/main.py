@@ -760,14 +760,32 @@ async def compare_file_ocr(identifier: str):
     compare_cfg = cfg.get("compare", {})
     source_path = Path(source)
     is_pdf = source_path.suffix.lower() == ".pdf"
+    is_ceb = source_path.suffix.lower() == ".ceb"
     pdf_page_count = 0
     image_bytes = None
+    ceb_pages = []
     if is_pdf:
         import fitz
         with fitz.open(source) as doc:
             if not doc.page_count:
                 raise HTTPException(status_code=422, detail="PDF 没有页面")
             pdf_page_count = doc.page_count
+    elif is_ceb:
+        try:
+            ceb_renderer = getattr(processor, "ceb_renderer", None)
+            if ceb_renderer is None:
+                from ingestion.ceb_renderer import CEBRenderer
+                ceb_renderer = CEBRenderer(processor.config)
+            ceb_pages = ceb_renderer.render(
+                source, match.get("file_hash") or processor.compute_hash(source)
+            ).page_paths
+            if not ceb_pages:
+                raise HTTPException(status_code=422, detail="CEB 没有可渲染页面")
+            pdf_page_count = len(ceb_pages)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"CEB 页面渲染失败: {exc}") from exc
     else:
         image_bytes = source_path.read_bytes()
 
@@ -793,12 +811,23 @@ async def compare_file_ocr(identifier: str):
 
     def run(client):
         try:
-            if is_pdf:
-                page_texts = client.recognize_pdf_pages(
-                    source,
-                    list(range(pdf_page_count)),
-                )
-                layout_by_page = getattr(client, "last_layout_pages", {}) or {}
+            if is_pdf or is_ceb:
+                if is_pdf:
+                    page_texts = client.recognize_pdf_pages(
+                        source,
+                        list(range(pdf_page_count)),
+                    )
+                    layout_by_page = getattr(client, "last_layout_pages", {}) or {}
+                else:
+                    page_texts = {}
+                    layout_by_page = {}
+                    for page_idx, page_path in enumerate(ceb_pages):
+                        page_texts[page_idx] = client.recognize_image(
+                            Path(page_path).read_bytes()
+                        ) or ""
+                        layout_by_page[page_idx] = list(
+                            getattr(client, "last_layout_blocks", []) or []
+                        )
                 page_results = []
                 all_blocks = []
                 text_parts = []

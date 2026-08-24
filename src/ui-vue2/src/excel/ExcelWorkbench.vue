@@ -94,11 +94,41 @@ const loadingList = ref(false)
 const uploadVisible = ref(false)
 const uploading = ref(false)
 const pendingFile = ref(null)
+const ACTIVE_WORKBOOK_KEY = 'excel-active-workbook'
+
+function rememberWorkbook(wb) {
+  if (!wb?.import_id) return
+  try {
+    localStorage.setItem(ACTIVE_WORKBOOK_KEY, JSON.stringify({
+      import_id: wb.import_id,
+      workbook_id: wb.workbook_id || null,
+    }))
+  } catch (_) {
+    // localStorage may be unavailable in private/embedded contexts.
+  }
+}
+
+function rememberedWorkbook() {
+  try {
+    const raw = localStorage.getItem(ACTIVE_WORKBOOK_KEY)
+    return raw ? JSON.parse(raw) : null
+  } catch (_) {
+    return null
+  }
+}
 
 async function refreshList() {
   loadingList.value = true
   try {
     workbooks.value = await listWorkbookImports({})
+    const currentId = selected.value?.import_id
+    const saved = rememberedWorkbook()
+    const targetId = currentId || saved?.import_id
+    const restored = workbooks.value.find((wb) => wb.import_id === targetId)
+    if (restored) {
+      selected.value = restored
+      rememberWorkbook(restored)
+    }
   } catch (e) {
     workbooks.value = []
   } finally {
@@ -108,6 +138,7 @@ async function refreshList() {
 
 function selectWorkbook(wb) {
   selected.value = wb
+  rememberWorkbook(wb)
 }
 
 function onFileChange(file) {
@@ -122,6 +153,7 @@ async function doUpload() {
     await refreshList()
     const fresh = await getWorkbookImport(data.import_id)
     selected.value = fresh
+    rememberWorkbook(fresh)
     uploadVisible.value = false
   } catch (e) {
     window.alert('上传失败: ' + (e?.message || e))
@@ -134,11 +166,13 @@ async function onActivated(confirm) {
   await refreshList()
   const data = await getWorkbookImport(confirm.import_id)
   selected.value = { ...data, workbook_id: confirm.workbook_id, active_version: confirm.version }
+  rememberWorkbook(selected.value)
 }
 
 async function reload() {
   if (selected.value) {
     selected.value = await getWorkbookImport(selected.value.import_id)
+    rememberWorkbook(selected.value)
   }
 }
 
