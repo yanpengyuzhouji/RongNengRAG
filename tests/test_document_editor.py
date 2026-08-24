@@ -9,6 +9,7 @@ from ingestion.document_editor import (
     apply_layout_edits,
     count_visual_assets,
     layout_page_texts,
+    layout_text_fingerprints,
     layout_revision,
 )
 
@@ -103,6 +104,49 @@ class DocumentEditorTests(unittest.TestCase):
         self.assertNotIn("onclick", stored)
         self.assertNotIn("script", stored)
         self.assertIn("新值", layout_page_texts(edited)[0][1])
+
+    def test_table_image_edit_keeps_safe_image_but_drops_editor_controls(self):
+        layout = {"0": [{
+            "block_type": "table",
+            "block_content": "<table><tr><td>图片</td></tr></table>",
+            "bbox": [0, 0, 300, 100],
+        }]}
+        edited, _ = apply_layout_edits(layout, [{
+            "page_num": 1,
+            "block_index": 0,
+            "op": "update",
+            "content_format": "html",
+            "content": (
+                '<table><tr><td><span class="layout-inline-image">'
+                '<img src="data:image/png;base64,AAAA"><button class="layout-delete-inline-image">删除图片</button>'
+                '</span></td></tr></table>'
+            ),
+        }])
+        stored = edited["0"][0]["block_content"]
+        self.assertIn('src="data:image/png;base64,AAAA"', stored)
+        self.assertNotIn("layout-inline-image", stored)
+        self.assertNotIn("layout-delete-inline-image", stored)
+        self.assertEqual(1, count_visual_assets(edited))
+        self.assertNotIn("data:image", layout_page_texts(edited)[0][1])
+
+    def test_delete_table_images_is_visual_only_and_handles_multiple_indexes(self):
+        layout = {"0": [{
+            "block_type": "table",
+            "block_content": (
+                '<table><tr><td>固定文字</td><td>'
+                '<img src="data:image/png;base64,AAAA"><img src="data:image/png;base64,BBBB">'
+                '</td></tr></table>'
+            ),
+            "bbox": [0, 0, 300, 100],
+        }]}
+        before = layout_text_fingerprints(layout)
+        edited, audit = apply_layout_edits(layout, [
+            {"page_num": 1, "block_index": 0, "op": "delete_table_image", "image_index": 0},
+            {"page_num": 1, "block_index": 0, "op": "delete_table_image", "image_index": 1},
+        ])
+        self.assertEqual(before, layout_text_fingerprints(edited))
+        self.assertEqual(0, count_visual_assets(edited))
+        self.assertEqual(2, len(audit))
 
 
 if __name__ == "__main__":

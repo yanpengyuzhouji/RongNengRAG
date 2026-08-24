@@ -44,6 +44,7 @@ from ingestion.document_editor import (
     apply_layout_edits,
     count_visual_assets,
     layout_page_texts,
+    layout_text_fingerprints,
     layout_revision,
 )
 
@@ -736,6 +737,55 @@ class FileProcessor:
                 if next_revision == current_revision:
                     raise LayoutEditError("修改内容与当前版本相同")
 
+                current_text_fingerprints = layout_text_fingerprints(current_layout)
+                next_text_fingerprints = layout_text_fingerprints(next_layout)
+                changed_text_pages = sorted({
+                    *current_text_fingerprints.keys(),
+                    *next_text_fingerprints.keys(),
+                } - {
+                    page_num
+                    for page_num in current_text_fingerprints.keys() & next_text_fingerprints.keys()
+                    if current_text_fingerprints[page_num] == next_text_fingerprints[page_num]
+                })
+                text_unchanged = not changed_text_pages
+
+                # Image/diagram-only edits change the visual source of truth
+                # but not what search can retrieve. Publishing only the cache
+                # avoids re-embedding an entire long document unnecessarily.
+                if text_unchanged:
+                    print(
+                        f"[EDIT] visual-only save file={file_hash} — vector sync skipped",
+                        flush=True,
+                    )
+                    serialized = json.dumps(next_layout, ensure_ascii=False).encode("utf-8")
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    layout_pending.write_bytes(serialized)
+                    edited_pending.write_bytes(serialized)
+                    layout_pending.replace(layout_path)
+                    cache_published = True
+                    edited_pending.replace(edited_path)
+                    edited_published = True
+                    # Keep SQLite's modification timestamp current without
+                    # changing text/chunk statistics or reindex counters.
+                    self._upsert_registry(file_hash)
+                    return {
+                        "success": True,
+                        "file_hash": file_hash,
+                        "revision": next_revision,
+                        "changes": audit_rows,
+                        "chunks_created": registry.get("chunks_count") or 0,
+                        "chars_indexed": registry.get("chars_count") or 0,
+                        "visual_assets": count_visual_assets(next_layout),
+                        "vector_sync_skipped": True,
+                        "text_changed_pages": [],
+                        "total_time_ms": (time.time() - t_start) * 1000,
+                    }
+
+                print(
+                    f"[EDIT] text changed on pages {changed_text_pages} for file={file_hash} "
+                    "— rebuilding vectors",
+                    flush=True,
+                )
                 file_path = registry.get("original_path") or registry.get("stored_path") or ""
                 file_meta = self._build_file_meta(
                     file_path or registry.get("file_name") or "",
@@ -809,6 +859,8 @@ class FileProcessor:
                     "chunks_created": len(chunks),
                     "chars_indexed": chars_count,
                     "visual_assets": count_visual_assets(next_layout),
+                    "vector_sync_skipped": False,
+                    "text_changed_pages": changed_text_pages,
                     "total_time_ms": (time.time() - t_start) * 1000,
                 }
             except BaseException:

@@ -276,18 +276,21 @@ retrieval:
 llm:
   provider: "openai"        # 仅支持 "openai" — 任意 OpenAI 兼容 /v1/chat/completions 服务
   openai:
-    base_url: "http://192.168.0.201:18000/v1"   # vLLM / Xinference / PaddleX serving 等
-    model: "/data/models/Qwen/Qwen3-4B"   # vLLM 注册的完整模型 id
+    base_url: "http://192.168.0.201:18002/v1"   # vLLM / Xinference / PaddleX serving 等
+    model: "/data/models/Qwen/Qwen3-14B-AWQ"   # vLLM 注册的完整模型 id
     api_key: ""             # 本地服务通常无需 key; 云服务填入真实 key
     api_key_env: "LLM_API_KEY"   # 优先从环境变量读取 (优先级: env > api_key)
     temperature: 0.1
     max_tokens: 4096
+    timeout: 110                    # 单次生成超时（秒），需小于前端 120 秒请求超时
+    health_timeout: 5               # /health/llm 连通性检查超时（秒）
     enable_thinking: false        # Qwen3/vLLM: 不输出 <think> 推理内容
 
 # ===== API配置 =====
 api:
   host: "0.0.0.0"
   port: 8000
+  warmup_models: false       # 默认延迟加载 BGE，避免启动时占满 CPU 阻塞预览
 
 # ===== 对话配置 =====
 conversation:

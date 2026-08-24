@@ -78,9 +78,10 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121   # CUDA 12
 llm:
   provider: "openai"
   openai:
-    base_url: "http://<LLM服务地址>/v1"   # 如 http://192.168.0.201:18000/v1
-    model: "/data/models/Qwen/Qwen3-4B"
+    base_url: "http://<LLM服务地址>/v1"   # 如 http://192.168.0.201:18002/v1
+    model: "/data/models/Qwen/Qwen3-14B-AWQ" # 必须与 GET /v1/models 返回的 id 一致
     api_key: ""                            # 本地服务留空; 云服务填真实 key
+    timeout: 110                            # 单次生成超时（秒），应小于前端请求超时
 
 ocr:
   provider: "vl"
@@ -120,24 +121,37 @@ retrieval:
   bm25_weight: 0.25
 ```
 
+配置后可先检查 LLM 连通性（无需发送生成请求）：`curl http://127.0.0.1:8000/health/llm`。
+接口会返回服务是否可达、配置模型是否已被 vLLM 注册；不可达、超时、鉴权失败和模型不存在都会返回可读的错误信息。
+
 首次运行会自动下载本地 BGE-M3 稀疏模型和 BGE-Reranker-v2-m3 重排模型到 `embedding.hf_home`；当前默认使用 CPU。Qwen 稠密向量仍调用 `embedding.openai` 配置的远程兼容 API。
 
 ### 3. 启动后端
 
+在 WSL 终端中执行：
+
 ```bash
+cd /mnt/d/git/RongNengRAG
+source venv/bin/activate
 cd src
 uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
 
 API 文档：http://localhost:8000/docs
 
+若虚拟环境目录为 `.venv`，将第二行替换为 `source .venv/bin/activate`。
+
 ### 4. 启动前端
 
+另开一个 WSL 终端执行：
+
 ```bash
-cd src/ui-vue2
-npm install
+cd /mnt/d/git/RongNengRAG/src/ui-vue2
+npm install  # 首次启动时执行
 npm run dev -- --host 0.0.0.0  # 局域网访问：http://<服务器局域网IP>:5174
 ```
+
+在 Windows 浏览器中访问 `http://localhost:5174`；后端 API 文档为 `http://localhost:8000/docs`。
 
 若后端不在本机，指定后端地址：
 

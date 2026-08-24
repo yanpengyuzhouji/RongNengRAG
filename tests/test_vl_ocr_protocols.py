@@ -1,5 +1,6 @@
 import unittest
 import sys
+import io
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -9,6 +10,8 @@ sys.modules.setdefault("httpx", Mock())
 from ingestion.vl_ocr import (
     VLOcrClient,
     _clean_fragmentary_html,
+    _inline_pipeline_table_images,
+    _sanitize_layout_content,
     extract_layout_outline,
     render_layout_html,
     render_layout_pages_html,
@@ -16,6 +19,29 @@ from ingestion.vl_ocr import (
 
 
 class VLOcrProtocolTests(unittest.TestCase):
+    def test_table_image_path_is_inlined_and_safe_renderer_keeps_it(self):
+        from PIL import Image
+
+        image = Image.new("RGB", (40, 30), color=(20, 40, 60))
+        raw = io.BytesIO()
+        image.save(raw, format="PNG")
+        blocks = [{
+            "block_label": "table",
+            "block_content": (
+                '<table><tr><td><img src="imgs/img_in_image_box_5_6_25_20.jpg" '
+                'alt="Image"></td></tr></table>'
+            ),
+        }]
+
+        enriched = _inline_pipeline_table_images(raw.getvalue(), blocks)
+        content = enriched[0]["block_content"]
+        self.assertIn("data:image/png;base64,", content)
+        self.assertNotIn("imgs/img_in_image_box", content)
+        self.assertIn("data:image/png;base64,", _sanitize_layout_content(content))
+        self.assertNotIn("https://example.invalid", _sanitize_layout_content(
+            '<img src="https://example.invalid/image.png">'
+        ))
+
     def test_fragmentary_table_markup_is_removed_but_complete_table_kept(self):
         text = "说明\n<td>415</td></tr><tr><td>335</td></tr></table>\n<table><tr><td>完整</td></tr></table>"
         cleaned = _clean_fragmentary_html(text)
@@ -139,6 +165,21 @@ class VLOcrProtocolTests(unittest.TestCase):
         self.assertIn("left:120.0px;top:220.0px;width:300.0px", html)
         self.assertIn("图 1 励磁系统响应曲线", html)
         self.assertIn("ocr-block:not(.ocr-visual-block)", html)
+
+    def test_editable_table_inline_image_has_delete_control(self):
+        blocks = [{
+            "bbox": [10, 20, 400, 260],
+            "block_type": "table",
+            "block_content": (
+                '<table><tr><td><img src="data:image/png;base64,AAAA" alt="图片示例"></td></tr></table>'
+            ),
+        }]
+        preview = render_layout_html(blocks)
+        editable = render_layout_html(blocks, editable=True)
+        self.assertNotIn("layout-delete-inline-image", preview)
+        self.assertIn("layout-delete-inline-image", editable)
+        self.assertIn("layout-inline-image", editable)
+        self.assertIn('data-inline-image-index="0"', editable)
 
     def test_editable_layout_uses_same_renderer_with_block_controls(self):
         blocks = [

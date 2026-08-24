@@ -164,6 +164,56 @@ class DocumentEditPublishTests(unittest.TestCase):
             self.assertFalse(processor.store.generation.activated)
             self.assertEqual(layout, json.loads(path.read_text(encoding="utf-8")))
 
+    def test_image_only_table_edit_skips_vector_generation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cache_dir = Path(temp)
+            layout = {"0": [{
+                "block_type": "table",
+                "block_content": (
+                    '<table><tr><td>说明</td><td><img src="data:image/png;base64,AAAA"></td></tr></table>'
+                ),
+                "bbox": [0, 0, 300, 100],
+            }]}
+            path = cache_dir / f"{FILE_HASH}.layout.json"
+            path.write_text(json.dumps(layout, ensure_ascii=False), encoding="utf-8")
+            processor = self.make_processor(cache_dir)
+
+            result = processor.save_layout_edits(FILE_HASH, layout_revision(layout), [{
+                "page_num": 1,
+                "block_index": 0,
+                "op": "update",
+                "content_format": "html",
+                "content": "<table><tr><td>说明</td><td></td></tr></table>",
+            }])
+
+            self.assertTrue(result["vector_sync_skipped"])
+            self.assertFalse(processor.store.generation.activated)
+            self.assertTrue((cache_dir / f"{FILE_HASH}.layout.edited.json").exists())
+            updated = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotIn("data:image", updated["0"][0]["block_content"])
+
+    def test_targeted_table_image_delete_skips_vector_generation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cache_dir = Path(temp)
+            layout = {"0": [{
+                "block_type": "table",
+                "block_content": '<table><tr><td>说明<img src="data:image/png;base64,AAAA"></td></tr></table>',
+                "bbox": [0, 0, 300, 100],
+            }]}
+            path = cache_dir / f"{FILE_HASH}.layout.json"
+            path.write_text(json.dumps(layout, ensure_ascii=False), encoding="utf-8")
+            processor = self.make_processor(cache_dir)
+
+            result = processor.save_layout_edits(FILE_HASH, layout_revision(layout), [{
+                "page_num": 1,
+                "block_index": 0,
+                "op": "delete_table_image",
+                "image_index": 0,
+            }])
+
+            self.assertTrue(result["vector_sync_skipped"])
+            self.assertFalse(processor.store.generation.activated)
+
     def test_registry_failure_rolls_back_alias_and_both_cache_files(self):
         with tempfile.TemporaryDirectory() as temp:
             cache_dir = Path(temp)

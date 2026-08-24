@@ -28,6 +28,7 @@ os.environ["no_proxy"] = "localhost,127.0.0.1,::1,0.0.0.0,.local"
 import json
 import re
 import time
+import threading
 import faulthandler
 faulthandler.enable(file=sys.stderr, all_threads=True)
 import shutil
@@ -51,6 +52,7 @@ from ingestion.document_editor import (
 from retrieval.retriever import Retriever, SearchResponse, RetrievalResult
 from retrieval.cross_domain import retrieve_cross_domain
 from generation.llm_engine import LLMEngine
+from generation.providers.openai_compat_provider import LLMServiceError
 from generation.conversation_manager import ConversationManager, beijing_now_display
 from config import load_config
 from api.security import (
@@ -93,7 +95,7 @@ app.add_middleware(
 @app.middleware("http")
 async def require_api_key(request: Request, call_next):
     """Fail closed for every data endpoint; health and CORS preflight stay public."""
-    if request.method == "OPTIONS" or request.url.path == "/health":
+    if request.method == "OPTIONS" or request.url.path in {"/health", "/health/llm"}:
         return await call_next(request)
     try:
         request.state.principal = _authenticator.authenticate(
@@ -129,26 +131,34 @@ async def startup():
     print(f"[startup] 数据目录: {cfg['paths']['uploads_dir']}")
     print(f"[startup] 向量库路径: {cfg['paths']['milvus_db']}")
 
-    # 预热嵌入模型和重排序模型(避免首次请求等待)
-    # 注意: OCR 不在启动时预热 — PaddleOCR 3个子模型 ~3-4GB 显存，
-    #   与 BGE-M3(~2GB) + BGE-Reranker(~2GB) 同时加载会撑爆 12GB 显存
-    # 注意: 不用 daemon 线程 — CUDA 在 daemon 线程中操作可能触发段错误 (torch 2.8+)
-    import concurrent.futures
-    def warmup():
-        print("[startup] 预热嵌入模型...")
-        try:
-            e = get_retriever()
-            _ = e.embedder.encode_query("预热测试")
-            print("[startup] 嵌入+重排序模型预热完成")
-        except Exception as ex:
-            print(f"[startup] 模型预热跳过: {ex}")
-    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="warmup")
-    _executor.submit(warmup)
+    # BGE-M3 sparse encoding is CPU-intensive. Starting it automatically can
+    # starve the API event loop just as users open a large document preview.
+    # Keep models lazy by default; deployments that explicitly prefer a warm
+    # first query can opt in via api.warmup_models.
+    if bool(cfg.get("api", {}).get("warmup_models", False)):
+        import concurrent.futures
+
+        def warmup():
+            print("[startup] 预热嵌入模型...")
+            try:
+                e = get_retriever()
+                _ = e.embedder.encode_query("预热测试")
+                print("[startup] 嵌入+重排序模型预热完成")
+            except Exception as ex:
+                print(f"[startup] 模型预热跳过: {ex}")
+
+        _executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="warmup"
+        )
+        _executor.submit(warmup)
+    else:
+        print("[startup] 跳过检索模型预热（api.warmup_models=false）")
 
 # 全局实例 (延迟加载)
 _processor: FileProcessor = None
 _retriever: Retriever = None
 _llm: LLMEngine = None
+_llm_init_error: str = ""
 _conv_mgr: ConversationManager = None
 
 
@@ -253,13 +263,25 @@ def invalidate_retriever() -> None:
 
 
 def get_llm():
-    global _llm
+    global _llm, _llm_init_error
     if _llm is None:
         try:
             _llm = LLMEngine()
-        except Exception:
+            _llm_init_error = ""
+        except Exception as exc:
+            _llm_init_error = f"LLM 初始化失败（{type(exc).__name__}）"
+            print(f"[llm] {_llm_init_error}: {exc}", flush=True)
             _llm = None
     return _llm
+
+
+def _llm_error_message(exc: Exception = None) -> str:
+    """Return a user-facing LLM failure message without leaking SDK internals."""
+    if isinstance(exc, LLMServiceError):
+        return str(exc)
+    if exc is not None:
+        return "LLM 调用失败，请检查 LLM 服务配置和运行日志。"
+    return _llm_init_error or "LLM 未初始化，请检查 LLM 服务配置。"
 
 
 def get_conv_mgr():
@@ -287,6 +309,31 @@ class UploadResponse(BaseModel):
     error_message: str = ""
 
 
+_reindexing_file_hashes: set[str] = set()
+_reindex_task_lock = threading.Lock()
+
+
+def _run_reindex_task(processor: FileProcessor, file_hash: str) -> None:
+    """Run a long reindex outside FastAPI's request event loop."""
+    try:
+        result = processor.reindex(file_hash)
+        print(
+            f"[reindex-background] file={result.file_name!r} "
+            f"status={result.status.value!r} chunks={result.chunks_created} "
+            f"error={result.error_message!r}",
+            flush=True,
+        )
+        if result.status == FileStatus.COMPLETED:
+            invalidate_retriever()
+    except BaseException as exc:
+        # Ensure a worker exception never leaves a file appearing to run forever.
+        processor._upsert_registry(file_hash, status="failed", error=str(exc)[:1000])
+        print(f"[reindex-background] file_hash={file_hash} failed: {exc}", flush=True)
+    finally:
+        with _reindex_task_lock:
+            _reindexing_file_hashes.discard(file_hash)
+
+
 class BatchUploadResponse(BaseModel):
     total: int
     success_count: int
@@ -297,7 +344,8 @@ class BatchUploadResponse(BaseModel):
 class LayoutEditOperation(BaseModel):
     page_num: int = Field(..., ge=1)
     block_index: int = Field(..., ge=0)
-    op: str = Field(default="update", pattern="^(update|delete)$")
+    op: str = Field(default="update", pattern="^(update|delete|delete_table_image)$")
+    image_index: Optional[int] = Field(default=None, ge=0)
     content: str = Field(default="", max_length=65535)
     content_format: str = Field(default="text", pattern="^(text|html)$")
 
@@ -962,7 +1010,11 @@ async def rebuild_preview_assets(identifier: str):
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=f"版面缓存无法读取: {exc}")
 
-    from ingestion.vl_ocr import VLOcrClient, _attach_visual_assets
+    from ingestion.vl_ocr import (
+        VLOcrClient,
+        _attach_visual_assets,
+        _inline_pipeline_table_images,
+    )
 
     ocr_cfg = load_config().get("ocr", {})
     vl_cfg = ocr_cfg.get("vl", {})
@@ -976,8 +1028,24 @@ async def rebuild_preview_assets(identifier: str):
         protocol=vl_cfg.get("protocol", "openai"),
         endpoint=vl_cfg.get("endpoint", "/ocr"),
     )
-    if Path(source).suffix.lower() == ".pdf" and isinstance(layout_cache, dict):
+    source_suffix = Path(source).suffix.lower()
+    if source_suffix == ".pdf" and isinstance(layout_cache, dict):
         enriched = client.enrich_layout_pages_with_visual_assets(source, layout_cache)
+    elif source_suffix == ".ceb" and isinstance(layout_cache, dict):
+        ceb_renderer = getattr(processor, "ceb_renderer", None)
+        if ceb_renderer is None:
+            from ingestion.ceb_renderer import CEBRenderer
+            ceb_renderer = CEBRenderer(processor.config)
+        rendered = ceb_renderer.render(source, match.get("file_hash") or processor.compute_hash(source))
+        enriched = {}
+        for raw_page, blocks in layout_cache.items():
+            try:
+                page_index = int(raw_page)
+                page_bytes = rendered.page_paths[page_index].read_bytes()
+            except (IndexError, OSError, TypeError, ValueError):
+                enriched[raw_page] = blocks
+                continue
+            enriched[raw_page] = _inline_pipeline_table_images(page_bytes, blocks)
     elif isinstance(layout_cache, list):
         enriched = _attach_visual_assets(Path(source).read_bytes(), layout_cache)
     else:
@@ -1000,10 +1068,16 @@ async def rebuild_preview_assets(identifier: str):
         for block in (blocks if isinstance(blocks, list) else [])
         if isinstance(block, dict) and block.get("visual_data_uri")
     )
+    inline_table_image_count = sum(
+        str(block.get("block_content") or "").count("data:image/")
+        for blocks in (enriched.values() if isinstance(enriched, dict) else [enriched])
+        for block in (blocks if isinstance(blocks, list) else [])
+        if isinstance(block, dict)
+    )
     return {
         "success": True,
         "file_hash": match.get("file_hash"),
-        "visual_assets": visual_count,
+        "visual_assets": visual_count + inline_table_image_count,
         "message": "预览资源已补建，未重新 OCR、分块或写入向量",
     }
 
@@ -1149,33 +1223,38 @@ async def recover_pending_files():
     )
 
 
-@app.post("/files/{identifier}/reindex", response_model=UploadResponse)
-async def reindex_file(identifier: str):
-    """重建文件索引 (删除后重新解析+嵌入+入库)"""
+@app.post("/files/{identifier}/reindex", response_model=UploadResponse, status_code=202)
+async def reindex_file(identifier: str, background_tasks: BackgroundTasks):
+    """Queue a file reindex without blocking API requests during long OCR."""
     processor = get_processor()
-    result = processor.reindex(identifier)
-    if result.status == FileStatus.COMPLETED:
-        invalidate_retriever()
-    print(
-        f"[reindex] identifier={identifier} file={result.file_name!r} "
-        f"status={result.status.value!r} success={result.status == FileStatus.COMPLETED} "
-        f"chunks={result.chunks_created} error={result.error_message!r}",
-        flush=True,
-    )
+    file_hash = processor._resolve_hash(identifier)
+    if not file_hash:
+        raise HTTPException(status_code=404, detail="文件未在注册表中找到")
+    record = processor._get_registry(file_hash)
+    if not record:
+        raise HTTPException(status_code=404, detail="文件注册信息丢失")
+
+    with _reindex_task_lock:
+        already_running = file_hash in _reindexing_file_hashes
+        if not already_running:
+            _reindexing_file_hashes.add(file_hash)
+            processor._upsert_registry(file_hash, status="processing", error="")
+            background_tasks.add_task(_run_reindex_task, processor, file_hash)
+
     return UploadResponse(
-        success=result.status == FileStatus.COMPLETED,
-        file_name=result.file_name,
-        file_hash=result.file_hash,
-        status=result.status.value,
-        chunks_created=result.chunks_created,
-        chars_extracted=result.chars_extracted,
-        domain=result.domain,
-        category=result.category,
-        doc_number=result.doc_number,
-        parse_time_ms=result.parse_time_ms,
-        embed_time_ms=result.embed_time_ms,
-        total_time_ms=result.total_time_ms,
-        error_message=result.error_message,
+        success=True,
+        file_name=record.get("file_name", ""),
+        file_hash=file_hash,
+        status="processing",
+        chunks_created=record.get("chunks_count", 0),
+        chars_extracted=record.get("chars_count", 0),
+        domain=record.get("domain", ""),
+        category=record.get("category", ""),
+        doc_number=record.get("doc_number", ""),
+        parse_time_ms=0,
+        embed_time_ms=0,
+        total_time_ms=0,
+        error_message="已在处理中" if already_running else "",
     )
 
 
@@ -1220,6 +1299,26 @@ async def list_files(
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "RAG 知识库", "version": "2.0.0"}
+
+
+@app.get("/health/llm")
+async def llm_health():
+    """Check the configured OpenAI-compatible LLM without sending a generation request."""
+    llm = get_llm()
+    if not llm:
+        return JSONResponse(
+            status_code=503,
+            content={"available": False, "error_code": "llm_init_error", "message": _llm_error_message()},
+        )
+    try:
+        result = llm.health_check()
+    except Exception as exc:
+        result = {
+            "available": False,
+            "error_code": "llm_health_error",
+            "message": _llm_error_message(exc),
+        }
+    return JSONResponse(status_code=200 if result["available"] else 503, content=result)
 
 
 @app.get("/stats")
@@ -1353,11 +1452,11 @@ async def ask(req: AskRequest):
                 )
                 citations = llm.extract_citations(answer)
             except Exception as e:
-                answer = f"⚠ LLM 不可用: {e}\n\n统计结果:\n{stats_result.formatted_table}"
+                answer = f"⚠ {_llm_error_message(e)}\n\n统计结果:\n{stats_result.formatted_table}"
                 citations = []
         else:
             # LLM 未部署, 直接返回统计表
-            answer = f"⚠ LLM 未部署。\n\n{stats_result.formatted_table}"
+            answer = f"⚠ {_llm_error_message()}\n\n{stats_result.formatted_table}"
             citations = []
 
         sources = []
@@ -1456,7 +1555,7 @@ async def ask(req: AskRequest):
             answer = llm.generate_chat(messages, temperature=0.1)
             citations = llm.extract_citations(answer)
         except Exception as e:
-            answer = f"⚠ 回答生成失败 ({type(e).__name__}): {e}\n\n检索到 {resp.total_candidates} 条"
+            answer = f"⚠ {_llm_error_message(e)}\n\n检索到 {resp.total_candidates} 条"
             citations = []
 
         # 记录助手回复
@@ -1473,10 +1572,10 @@ async def ask(req: AskRequest):
             )
             citations = llm.extract_citations(answer)
         except Exception as e:
-            answer = f"⚠ 回答生成失败 ({type(e).__name__}): {e}\n\n检索到 {resp.total_candidates} 条"
+            answer = f"⚠ {_llm_error_message(e)}\n\n检索到 {resp.total_candidates} 条"
             citations = []
     else:
-        answer = "⚠ LLM 服务不可用。请检查 LLM 服务配置。\n\n## 检索到的资料\n"
+        answer = f"⚠ {_llm_error_message()}\n\n## 检索到的资料\n"
         for i, rr in enumerate(resp.results[:5]):
             answer += f"\n**{i + 1}. {rr.doc_number or rr.file_path}**\n> {rr.text[:300]}...\n"
         citations = []
@@ -1528,10 +1627,10 @@ async def ask_stream(req: AskRequest):
                         yield f"data: {json.dumps({'token': token, 'done': False})}\n\n"
                     citations = llm.extract_citations(full_answer)
                 except Exception as e:
-                    full_answer = f"⚠ 错误: {e}\n\n{stats_result.formatted_table}"
+                    full_answer = f"⚠ {_llm_error_message(e)}\n\n{stats_result.formatted_table}"
                     citations = []
             else:
-                full_answer = f"⚠ LLM 未部署。\n\n{stats_result.formatted_table}"
+                full_answer = f"⚠ {_llm_error_message()}\n\n{stats_result.formatted_table}"
                 citations = []
 
             yield f"data: {json.dumps({'token': '', 'done': True, 'citations': citations, 'sources': file_sources, 'elapsed_ms': (time.time() - t0) * 1000, 'full_answer': full_answer})}\n\n"
@@ -1582,7 +1681,7 @@ async def ask_stream(req: AskRequest):
         llm = get_llm()
 
         if not llm:
-            yield f"data: {json.dumps({'token': '⚠ LLM 未部署', 'done': True})}\n\n"
+            yield f"data: {json.dumps({'token': '⚠ ' + _llm_error_message(), 'done': True, 'error_code': 'llm_init_error'})}\n\n"
             return
 
         # 按文件去重 sources, 附带 top5 chunk 文本供前端弹窗
@@ -1654,8 +1753,9 @@ async def ask_stream(req: AskRequest):
                 yield f"data: {json.dumps({'token': '', 'done': True, 'citations': citations, 'sources': cited_sources, 'elapsed_ms': (time.time() - t0) * 1000, 'full_answer': full_answer})}\n\n"
 
         except Exception as e:
-            message = f"⚠ 回答生成失败 ({type(e).__name__}): {e}"
-            yield f"data: {json.dumps({'token': message, 'done': True})}\n\n"
+            message = f"⚠ {_llm_error_message(e)}"
+            error_code = e.code if isinstance(e, LLMServiceError) else "llm_error"
+            yield f"data: {json.dumps({'token': message, 'done': True, 'error_code': error_code})}\n\n"
 
     return StreamingResponse(
         generate(),

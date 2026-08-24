@@ -145,16 +145,34 @@ def _sanitize_layout_content(content: str) -> str:
         content,
         flags=re.I,
     )
-    # Remove event handlers and URL-bearing attributes.  Table structure
-    # attributes such as rowspan/colspan remain intact.
+    # Remove event handlers and URL-bearing attributes. Table structure
+    # attributes such as rowspan/colspan remain intact. Data-image URIs are
+    # produced locally from the uploaded page and are the sole safe exception.
     content = re.sub(
         r"\s+on[a-z]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)",
         "",
         content,
         flags=re.I,
     )
+    def preserve_safe_image_src(match):
+        value = (
+            match.group("double")
+            or match.group("single")
+            or match.group("bare")
+            or ""
+        )
+        if re.fullmatch(r"data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+", value, re.I):
+            return f' src="{value}"'
+        return ""
+
     content = re.sub(
-        r"\s+(?:src|href|action|formaction)\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)",
+        r"\s+src\s*=\s*(?:\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'|(?P<bare>[^\s>]+))",
+        preserve_safe_image_src,
+        content,
+        flags=re.I,
+    )
+    content = re.sub(
+        r"\s+(?:href|action|formaction)\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)",
         "",
         content,
         flags=re.I,
@@ -205,6 +223,16 @@ def _compact_layout_text(text: str) -> str:
 # deleting a visual block also removes any OCR text covered by its bbox.
 _VISUAL_BLOCK_KINDS = VISUAL_BLOCK_KINDS
 _MAX_VISUAL_ASSET_BYTES = 2 * 1024 * 1024
+_PIPELINE_IMAGE_TAG_RE = re.compile(r"<img\b[^>]*>", flags=re.I)
+_PIPELINE_IMAGE_BOX_RE = re.compile(
+    r"(?:^|[\\/'\"=])imgs[\\/]img_in_image_box_"
+    r"(?P<x1>\d+)_(?P<y1>\d+)_(?P<x2>\d+)_(?P<y2>\d+)\.(?:jpe?g|png)",
+    flags=re.I,
+)
+_SAFE_DATA_IMAGE_RE = re.compile(
+    r"data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+",
+    flags=re.I,
+)
 
 
 def _is_visual_block_kind(kind: str) -> bool:
@@ -311,6 +339,101 @@ def _attach_visual_assets(image_bytes: bytes, blocks: list) -> list:
                         print(f"[vl-ocr] visual asset crop failed: {exc}", flush=True)
         attached.append(item)
     return attached
+
+
+def _inline_pipeline_table_images(image_bytes: bytes, blocks: list) -> list:
+    """Replace Pipeline's inaccessible table-image paths with safe image data URIs.
+
+    PaddleOCR Pipeline detects photos inside tables but emits them as relative
+    paths such as ``imgs/img_in_image_box_514_391_711_513.jpg``. Those files
+    only exist inside the OCR container. The coordinates encode the crop on
+    the submitted page image, so derive it locally for the layout cache only.
+    """
+    if not image_bytes or not isinstance(blocks, list):
+        return list(blocks or [])
+    if not any(
+        isinstance(block, dict)
+        and "img_in_image_box_" in str(block.get("block_content") or "")
+        for block in blocks
+    ):
+        return [dict(block) if isinstance(block, dict) else block for block in blocks]
+    try:
+        from PIL import Image
+
+        source = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as exc:
+        print(f"[vl-ocr] inline table image source unavailable: {exc}", flush=True)
+        return [dict(block) if isinstance(block, dict) else block for block in blocks]
+
+    width, height = source.size
+    crop_cache = {}
+
+    def replace_tag(match):
+        tag = match.group(0)
+        location = _PIPELINE_IMAGE_BOX_RE.search(tag)
+        if not location:
+            return tag
+        box = tuple(int(location.group(name)) for name in ("x1", "y1", "x2", "y2"))
+        if box not in crop_cache:
+            x1, y1, x2, y2 = box
+            left, top = max(0, x1), max(0, y1)
+            right, bottom = min(width, x2), min(height, y2)
+            if right <= left or bottom <= top:
+                crop_cache[box] = ""
+            else:
+                try:
+                    output = io.BytesIO()
+                    source.crop((left, top, right, bottom)).save(
+                        output, format="PNG", optimize=True
+                    )
+                    payload = output.getvalue()
+                    crop_cache[box] = (
+                        "data:image/png;base64," + base64.b64encode(payload).decode("ascii")
+                        if len(payload) <= _MAX_VISUAL_ASSET_BYTES else ""
+                    )
+                except Exception as exc:
+                    print(f"[vl-ocr] inline table image crop failed: {exc}", flush=True)
+                    crop_cache[box] = ""
+        data_uri = crop_cache[box]
+        return f'<img src="{data_uri}" alt="图片示例">' if data_uri else tag
+
+    enriched = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            enriched.append(block)
+            continue
+        item = dict(block)
+        content = str(item.get("block_content") or "")
+        if "img_in_image_box_" in content:
+            item["block_content"] = _PIPELINE_IMAGE_TAG_RE.sub(replace_tag, content)
+        enriched.append(item)
+    return enriched
+
+
+def _decorate_editable_table_images(content: str) -> str:
+    """Add per-image delete controls to already-sanitized table HTML."""
+    if not content or "data:image/" not in content:
+        return content
+
+    image_index = 0
+
+    def replace(match):
+        nonlocal image_index
+        tag = match.group(0)
+        current_index = image_index
+        image_index += 1
+        return (
+            '<span class="layout-inline-image">'
+            f'{tag}<button type="button" class="layout-delete-inline-image" '
+            f'data-inline-image-index="{current_index}" title="删除图片">删除图片</button></span>'
+        )
+
+    return re.sub(
+        r'<img\b[^>]*\bsrc\s*=\s*"data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+"[^>]*>',
+        replace,
+        content,
+        flags=re.I,
+    )
 
 
 def _toc_depth(title: str) -> int:
@@ -841,6 +964,8 @@ def render_layout_html(blocks, page_num: int = 1, editable: bool = False) -> str
             rendered = _render_toc_html(content)
         elif is_table:
             rendered = _sanitize_layout_content(content)
+            if editable:
+                rendered = _decorate_editable_table_images(rendered)
         elif "formula" in kind or "equation" in kind:
             rendered = html_lib.escape(content)
         else:
@@ -1018,6 +1143,13 @@ def render_layout_html(blocks, page_num: int = 1, editable: bool = False) -> str
             'before:"[图片]",content:"",content_format:"text"});'
             '});'
             'document.addEventListener("click",function(event){'
+            'var button=event.target.closest(".layout-delete-inline-image");if(!button)return;'
+            'event.preventDefault();event.stopPropagation();var wrap=button.closest(".layout-inline-image"),'
+            'block=button.closest(".ocr-block"),imageIndex=Number(button.dataset.inlineImageIndex);'
+            'if(!wrap||!block||!Number.isInteger(imageIndex)||imageIndex<0)return;wrap.remove();send({op:"delete_table_image",'
+            'block_index:Number(block.dataset.sourceIndex),image_index:imageIndex,before:"[表格内图片]",content:"",content_format:"html"});'
+            '});'
+            'document.addEventListener("click",function(event){'
             'var button=event.target.closest(".layout-edit-formula");if(!button)return;'
             'event.preventDefault();event.stopPropagation();var block=button.closest(".ocr-block");if(!block)return;'
             'var current=button.dataset.currentContent||"",next=window.prompt("编辑 LaTeX 公式",current);'
@@ -1058,6 +1190,11 @@ def render_layout_html(blocks, page_num: int = 1, editable: bool = False) -> str
             'padding:7px 10px;background:#b42318;color:#fff;font:600 13px/1 Arial,"Microsoft YaHei",sans-serif;'
             'cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.22)}'
             '.ocr-visual-block:hover>.layout-delete-visual{display:block}'
+            '.layout-inline-image{position:relative;display:inline-block;max-width:100%;line-height:0}'
+            '.layout-inline-image>img{display:block;max-width:100%;height:auto}'
+            '.layout-delete-inline-image{position:absolute;right:3px;top:3px;display:none;border:0;border-radius:3px;'
+            'padding:3px 5px;background:#d84a4a;color:#fff;font-size:11px;line-height:1.2;cursor:pointer}'
+            '.layout-inline-image:hover>.layout-delete-inline-image{display:block}'
             '.layout-edit-formula{position:absolute;right:2px;top:-30px;display:none;border:1px solid #2f6fdb;'
             'border-radius:3px;padding:5px 8px;background:#fff;color:#1f5fbf;font:600 12px/1 Arial,"Microsoft YaHei",sans-serif;'
             'cursor:pointer;white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,.12)}'
@@ -1452,6 +1589,11 @@ class VLOcrClient:
                     blocks.append(
                         _dedupe_markdown(_normalize_ocr_escaped_newlines(markdown))
                     )
+        # Keep image data out of the text returned for chunking/indexing. Only
+        # the persisted layout blocks need self-contained table image assets.
+        self.last_layout_blocks = _inline_pipeline_table_images(
+            image_bytes, self.last_layout_blocks
+        )
         return "\n\n".join(_dedupe_blocks(blocks)).strip()
 
     def recognize_pdf_pages(self, pdf_path: str,

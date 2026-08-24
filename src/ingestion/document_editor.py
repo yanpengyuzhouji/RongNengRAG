@@ -33,6 +33,14 @@ VISUAL_BLOCK_KINDS = {
 }
 MAX_EDIT_OPERATIONS = 5000
 MAX_BLOCK_CONTENT = 65535
+_SAFE_DATA_IMAGE_RE = re.compile(
+    r"data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+",
+    flags=re.IGNORECASE,
+)
+_INLINE_DATA_IMAGE_TAG_RE = re.compile(
+    r'<img\b[^>]*\bsrc\s*=\s*"data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+"[^>]*>',
+    flags=re.IGNORECASE,
+)
 
 
 class LayoutEditError(ValueError):
@@ -127,8 +135,32 @@ def _sanitize_content(value, content_format: str) -> str:
             content,
             flags=re.IGNORECASE | re.DOTALL,
         )
+        # Editor-only wrappers/buttons are added around inline table images in
+        # the iframe. Never persist those controls in the layout cache.
+        content = re.sub(
+            r"<button\b[^>]*\blayout-delete-inline-image\b[^>]*>.*?</button\s*>",
+            "",
+            content,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        content = re.sub(
+            r"</?span\b[^>]*\blayout-inline-image\b[^>]*>",
+            "",
+            content,
+            flags=re.IGNORECASE,
+        )
         content = re.sub(r"\s+on\w+\s*=\s*(['\"]).*?\1", "", content, flags=re.I | re.S)
-        content = re.sub(r"\s+(src|href|action|formaction)\s*=\s*(['\"]).*?\2", "", content, flags=re.I | re.S)
+        def preserve_safe_image_src(match):
+            value = match.group("double") or match.group("single") or ""
+            return f' src="{value}"' if _SAFE_DATA_IMAGE_RE.fullmatch(value) else ""
+
+        content = re.sub(
+            r"\s+src\s*=\s*(?:\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)')",
+            preserve_safe_image_src,
+            content,
+            flags=re.I | re.S,
+        )
+        content = re.sub(r"\s+(href|action|formaction)\s*=\s*(['\"]).*?\2", "", content, flags=re.I | re.S)
     else:
         # Browser innerText may contain non-breaking spaces from rendered OCR.
         content = html.unescape(content).replace("\u00a0", " ")
@@ -187,26 +219,64 @@ def apply_layout_edits(layout_cache, edits: Iterable[dict]):
         except (TypeError, ValueError) as exc:
             raise LayoutEditError("修改项缺少有效页码或版面块序号") from exc
         op = str(operation.get("op") or "update").lower()
-        if op not in {"update", "delete"}:
+        if op not in {"update", "delete", "delete_table_image"}:
             raise LayoutEditError(f"不支持的修改操作: {op}")
-        key = (page_num, block_index)
+        image_index = operation.get("image_index")
+        if op == "delete_table_image":
+            try:
+                image_index = int(image_index)
+            except (TypeError, ValueError) as exc:
+                raise LayoutEditError("删除表格图片缺少有效图片序号") from exc
+            if image_index < 0:
+                raise LayoutEditError("删除表格图片序号无效")
+            key = (page_num, block_index, op, image_index)
+        else:
+            key = (page_num, block_index)
         if key in seen:
             raise LayoutEditError("同一版面块不能在一次保存中重复修改")
         seen.add(key)
         if page_num not in pages or block_index < 0 or block_index >= len(pages[page_num]):
             raise LayoutEditError(f"第 {page_num} 页版面块 {block_index} 不存在")
-        grouped.setdefault(page_num, []).append({**operation, "op": op, "block_index": block_index})
+        grouped.setdefault(page_num, []).append({
+            **operation, "op": op, "block_index": block_index, "image_index": image_index,
+        })
 
     audit_rows = []
     for page_num, page_operations in grouped.items():
         blocks = pages[page_num]
         delete_indices = set()
-        for operation in page_operations:
+        # Delete higher inline-image indexes first, otherwise removing image 0
+        # would shift image 1 to index 0 in the same table block.
+        ordered_operations = sorted(
+            page_operations,
+            key=lambda operation: (
+                operation["block_index"],
+                0 if operation["op"] == "delete_table_image" else 1,
+                -int(operation.get("image_index") or 0),
+            ),
+        )
+        for operation in ordered_operations:
             index = operation["block_index"]
             block = blocks[index]
             if not isinstance(block, dict):
                 raise LayoutEditError(f"第 {page_num} 页版面块 {index} 格式无效")
             before = str(block.get("block_content") or "")
+            if operation["op"] == "delete_table_image":
+                image_index = operation["image_index"]
+                matches = list(_INLINE_DATA_IMAGE_TAG_RE.finditer(before))
+                if image_index >= len(matches):
+                    raise LayoutEditError(f"第 {page_num} 页版面块 {index} 的图片序号不存在")
+                target = matches[image_index]
+                block["block_content"] = before[:target.start()] + before[target.end():]
+                audit_rows.append({
+                    "page_num": page_num,
+                    "block_index": index,
+                    "op": "delete_table_image",
+                    "kind": _block_kind(block),
+                    "before": "[表格内图片]",
+                    "after": "",
+                })
+                continue
             if operation["op"] == "delete":
                 delete_indices.add(index)
                 if _block_kind(block) in VISUAL_BLOCK_KINDS:
@@ -274,12 +344,37 @@ def layout_page_texts(layout_cache) -> List[Tuple[int, str]]:
     return page_texts
 
 
+def layout_text_fingerprints(layout_cache) -> Dict[int, str]:
+    """Return a stable per-page fingerprint of text that participates in search.
+
+    Visual assets, HTML structure and whitespace-only edits intentionally do
+    not change this result. Callers can therefore skip vector synchronization
+    when a save only changes preview presentation.
+    """
+    return {
+        page_num: hashlib.sha256(
+            re.sub(r"\s+", " ", text or "").strip().encode("utf-8")
+        ).hexdigest()
+        for page_num, text in layout_page_texts(layout_cache)
+    }
+
+
 def count_visual_assets(layout_cache) -> int:
-    return sum(
-        1
-        for _, blocks in _page_entries(layout_cache)
-        for block in blocks
-        if isinstance(block, dict)
-        and _block_kind(block) in VISUAL_BLOCK_KINDS
-        and str(block.get("visual_data_uri") or "").startswith("data:image/")
-    )
+    count = 0
+    for _, blocks in _page_entries(layout_cache):
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if (
+                _block_kind(block) in VISUAL_BLOCK_KINDS
+                and str(block.get("visual_data_uri") or "").startswith("data:image/")
+            ):
+                count += 1
+            # Pipeline table cells can contain locally derived data-image URIs
+            # instead of separate image/chart layout blocks.
+            count += len(re.findall(
+                r"data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+",
+                str(block.get("block_content") or ""),
+                flags=re.IGNORECASE,
+            ))
+    return count

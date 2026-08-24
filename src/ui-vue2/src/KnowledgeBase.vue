@@ -25,7 +25,8 @@
         </el-input>
         <el-select v-model="filterStatus" placeholder="解析状态" clearable @change="fetchData" style="width:130px">
           <el-option label="已完成" value="completed" />
-          <el-option label="处理中" value="pending" />
+          <el-option label="处理中" value="processing" />
+          <el-option label="待处理" value="pending" />
           <el-option label="失败" value="failed" />
         </el-select>
         <el-select v-model="filterDomain" placeholder="专业域" clearable @change="onDomainChange" style="width:120px">
@@ -77,8 +78,10 @@
             <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
             <el-button link type="primary" size="small" @click="handleDownload(row)">下载</el-button>
             <el-button link type="success" size="small" @click="$emit('preview', row)">预览</el-button>
-            <el-button v-if="row.status === 'failed'" link type="warning" size="small" @click="handleReindex(row)">重解析</el-button>
-            <el-button v-if="row.status !== 'pending'" link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
+            <el-button v-if="row.status === 'failed' || row.status === 'pending'" link type="warning" size="small" @click="handleReindex(row)">
+              {{ row.status === 'pending' ? '重试处理' : '重解析' }}
+            </el-button>
+            <el-button v-if="row.status !== 'processing'" link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -416,23 +419,28 @@ async function handleDelete(row) {
 }
 
 async function handleReindex(row) {
+  const action = row.status === 'pending' ? '重试处理' : '重解析'
   loading.value = true
   try {
     const res = await API.api('POST', `/files/${encodeURIComponent(row.file_hash)}/reindex`)
-    if (typeof res === 'string') { ElMessage.error('重解析失败: ' + res); return }
-    // 以明确的 completed 状态为成功依据；兼容旧后端未返回 success 的情况。
-    if (res.success === true || res.status === 'completed') {
+    if (typeof res === 'string') { ElMessage.error(`${action}失败: ` + res); return }
+    if (res.status === 'processing') {
+      row.status = 'processing'
+      ElMessage.info(res.error_message || '已开始后台处理，可继续浏览，稍后刷新查看结果')
+      await fetchData()
+    // 兼容旧后端同步返回 completed 的行为。
+    } else if (res.success === true || res.status === 'completed') {
       row.status = 'completed'
       row.chunks_count = res.chunks_created ?? row.chunks_count
       row.error_message = ''
-      ElMessage.success(`重解析完成: ${res.chunks_created || 0} 片段`)
+      ElMessage.success(`${action}完成: ${res.chunks_created || 0} 片段`)
       await fetchData()
       await fetchSummary()
     } else {
       ElMessage.warning(res.error_message || res.status || '失败')
     }
   } catch (error) {
-    ElMessage.error(`重解析失败: ${error?.message || error}`)
+    ElMessage.error(`${action}失败: ${error?.message || error}`)
   } finally {
     loading.value = false
   }
@@ -485,8 +493,8 @@ const iconMap = {
   '.wps': 'https://cdn-icons-png.flaticon.com/128/281/281760.png',
 }
 function fileIcon(ft) { return iconMap[ft] || iconMap['.pdf'] }
-function statusClass(s) { return { completed: 'done', pending: 'running', failed: 'failed', deleted: 'failed' }[s] || '' }
-function statusText(s) { return { completed: '已解析', pending: '处理中', failed: '解析失败', deleted: '已删除' }[s] || s }
+function statusClass(s) { return { completed: 'done', processing: 'running', pending: 'pending', failed: 'failed', deleted: 'failed' }[s] || '' }
+function statusText(s) { return { completed: '已解析', processing: '处理中', pending: '待处理', failed: '解析失败', deleted: '已删除' }[s] || s }
 
 // ════════ Directory Dialog (shell) ════════
 const dirVisible = ref(false)
@@ -536,6 +544,7 @@ onMounted(() => {
 .status-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
 .status-dot.done { background: #14a89a; }
 .status-dot.running { background: #3a8ee6; }
+.status-dot.pending { background: #e6a23c; }
 .status-dot.failed { background: #f56c6c; }
 
 .pagination-wrap { display: flex; justify-content: flex-end; margin-top: 16px; }

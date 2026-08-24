@@ -32,6 +32,10 @@ class LLMEngine:
     def model_name(self) -> str:
         return self._provider.model_name
 
+    def health_check(self) -> dict:
+        """Check whether the configured LLM endpoint is reachable."""
+        return self._provider.health_check()
+
     def generate(self, prompt: str, system: str = None, temperature: float = 0.1,
                  max_tokens: int = 4096, stream: bool = False) -> str:
         """生成回答"""

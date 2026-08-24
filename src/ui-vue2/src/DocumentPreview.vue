@@ -269,9 +269,14 @@ function onLayoutFrameMessage(event) {
     const pageNum = Number(data.page_num)
     const blockIndex = Number(data.block_index)
     if (!Number.isInteger(pageNum) || pageNum < 1 || !Number.isInteger(blockIndex) || blockIndex < 0) return
-    const key = `${pageNum}:${blockIndex}`
+    const imageIndex = Number(data.image_index)
+    const isTableImageDelete = data.op === 'delete_table_image'
+    if (isTableImageDelete && (!Number.isInteger(imageIndex) || imageIndex < 0)) return
+    const key = isTableImageDelete
+      ? `${pageNum}:${blockIndex}:image:${imageIndex}`
+      : `${pageNum}:${blockIndex}`
     const before = String(data.before || '')
-    const op = data.op === 'delete' ? 'delete' : 'update'
+    const op = isTableImageDelete ? 'delete_table_image' : (data.op === 'delete' ? 'delete' : 'update')
     const content = String(data.content || '')
     if (op === 'update' && content.trim() === before.trim()) {
       pendingEdits.delete(key)
@@ -282,10 +287,11 @@ function onLayoutFrameMessage(event) {
       page_num: pageNum,
       block_index: blockIndex,
       op,
+      image_index: isTableImageDelete ? imageIndex : undefined,
       content,
       content_format: data.content_format === 'html' ? 'html' : 'text',
-      before: before || (op === 'delete' ? '[图片]' : ''),
-      after: op === 'delete' ? '[已删除图片及图内识别内容]' : content,
+      before: before || (op === 'delete' || op === 'delete_table_image' ? '[图片]' : ''),
+      after: op === 'delete' ? '[已删除图片及图内识别内容]' : (op === 'delete_table_image' ? '[已删除表格内图片]' : content),
     })
     return
   }
@@ -512,6 +518,7 @@ async function saveEdit() {
       page_num: item.page_num,
       block_index: item.block_index,
       op: item.op,
+      image_index: item.image_index,
       content: item.content,
       content_format: item.content_format,
     }))
@@ -524,7 +531,14 @@ async function saveEdit() {
     editableLayoutPages.value = []
     isEditing.value = false
     await loadFileContent()
-    ElMessage.success(`已保存并同步 ${result.chunks_created} 个向量块`)
+    if (result.vector_sync_skipped) {
+      ElMessage.success('已保存图片/版式修改，检索文本未变化，无需同步向量')
+    } else {
+      const pages = Array.isArray(result.text_changed_pages) && result.text_changed_pages.length
+        ? `（文本变化页：${result.text_changed_pages.join('、')}）`
+        : ''
+      ElMessage.success(`已保存并同步 ${result.chunks_created} 个向量块${pages}`)
+    }
   } catch (e) {
     const detail = e?.body?.detail || e.message || e
     ElMessage.error(`保存失败：${detail}`)
