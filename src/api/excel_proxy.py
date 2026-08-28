@@ -1,6 +1,6 @@
 """Excel 工作簿微服务反向代理.
 
-浏览器统一走 RongNengRAG 后端(8000)的 /excel/* 路径,此处 1:1 转发到
+浏览器统一走 RongNengRAG 后端(8008)的 /excel/* 路径,此处 1:1 转发到
 Excel Workbook Service(默认 http://127.0.0.1:8090,前缀 /api/v1)。
 
 - 普通请求(上传/草稿/校验/确认/查询/报告): 整体转发,透传状态码与 content-type。

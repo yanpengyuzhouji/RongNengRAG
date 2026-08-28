@@ -42,7 +42,7 @@ python run.py            # 127.0.0.1:8090
 - **文档解析**：PDF、CEB 和 PNG/JPEG 等页面通过外部 **PaddleOCR-VL** 服务结构化识别（阅读顺序 + Markdown 表格 + 标题层级 + bbox），CEB 使用 Apabi 原生渲染为多页 PNG，不经过 PDF。
 - **混合检索**：稠密向量继续使用 ModelScope 的 `Qwen3-Embedding-0.6B`；稀疏向量由本地 CPU `BGE-M3` 生成并写入 Milvus；另有带语料 IDF 和文档长度归一化的 BM25 关键词分支，最终经过本地 CPU `BGE-Reranker-v2-m3` 重排。
 - **LLM 生成**：调用任意 **OpenAI 兼容** 的 `/v1/chat/completions` 服务（vLLM / Xinference / LM Studio / PaddleX serving 等），无需本地部署模型。
-- **前端**：Vue 3 + Element Plus（`src/ui-vue2`，默认 5174 端口）。
+- **前端**：Vue 3 + Element Plus（`src/ui-vue2`，默认 5178 端口）。
 
 文档预览同时支持检索文本和版面还原：PDF 按页缓存 OCR 版面块，预览时生成独立页面；标题目录支持章节层级导航，公式、表格、公式编号和目次/Contents 使用统一渲染规则。详细链路见 [`docs/PDF完整解析入库预览链路.md`](docs/PDF完整解析入库预览链路.md)、[`docs/PNG上传解析入库后处理预览流程.md`](docs/PNG上传解析入库后处理预览流程.md) 和 [`docs/开发日志.md`](docs/开发日志.md)。
 
@@ -121,7 +121,7 @@ retrieval:
   bm25_weight: 0.25
 ```
 
-配置后可先检查 LLM 连通性（无需发送生成请求）：`curl http://127.0.0.1:8000/health/llm`。
+配置后可先检查 LLM 连通性（无需发送生成请求）：`curl http://127.0.0.1:8008/health/llm`。
 接口会返回服务是否可达、配置模型是否已被 vLLM 注册；不可达、超时、鉴权失败和模型不存在都会返回可读的错误信息。
 
 首次运行会自动下载本地 BGE-M3 稀疏模型和 BGE-Reranker-v2-m3 重排模型到 `embedding.hf_home`；当前默认使用 CPU。Qwen 稠密向量仍调用 `embedding.openai` 配置的远程兼容 API。
@@ -134,10 +134,10 @@ retrieval:
 cd /mnt/d/git/RongNengRAG
 source venv/bin/activate
 cd src
-uvicorn api.main:app --host 0.0.0.0 --port 8000
+uvicorn api.main:app --host 0.0.0.0 --port 8008
 ```
 
-API 文档：http://localhost:8000/docs
+API 文档：http://localhost:8008/docs
 
 若虚拟环境目录为 `.venv`，将第二行替换为 `source .venv/bin/activate`。
 
@@ -148,16 +148,16 @@ API 文档：http://localhost:8000/docs
 ```bash
 cd /mnt/d/git/RongNengRAG/src/ui-vue2
 npm install  # 首次启动时执行
-npm run dev -- --host 0.0.0.0  # 局域网访问：http://<服务器局域网IP>:5174
+npm run dev -- --host 0.0.0.0  # 局域网访问：http://<服务器局域网IP>:5178
 ```
 
-在 Windows 浏览器中访问 `http://localhost:5174`；后端 API 文档为 `http://localhost:8000/docs`。
+在 Windows 浏览器中访问 `http://localhost:5178`；后端 API 文档为 `http://localhost:8008/docs`。
 
 若后端不在本机，指定后端地址：
 
 ```bash
 npm run dev -- --host 0.0.0.0     # 或用环境变量
-VITE_API_BASE=http://192.168.x.x:8000 npm run dev -- --host 0.0.0.0
+VITE_API_BASE=http://192.168.x.x:8008 npm run dev -- --host 0.0.0.0
 ```
 
 ### 5. 入库文档
@@ -211,7 +211,7 @@ src/
     reranker.py            # BGE-Reranker-v2-m3 本地 CPU/GPU 重排
   generation/              # LLM 生成
     providers/openai_compat_provider.py   # OpenAI 兼容 LLM
-  ui-vue2/                 # Vue 3 前端 (5174)
+  ui-vue2/                 # Vue 3 前端 (5178)
 scripts/build_index.py     # 命令行入库工具
 scripts/rebuild_sparse_vectors.py # 旧 sparse 向量迁移为 BGE-M3
 docs/PNG上传解析入库后处理预览流程.md  # 图片/PDF 上传、解析、入库与预览链路

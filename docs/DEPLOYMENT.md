@@ -11,7 +11,7 @@
 | LLM 服务 | 任意 OpenAI 兼容服务 | vLLM / Xinference / LM Studio / PaddleX serving / 云厂商 |
 | OCR-VL 服务 | PaddleOCR-VL (OpenAI 兼容) | 扫描件 PDF/图片的结构化识别 (可选) |
 | 后端 | FastAPI + Milvus Lite + Qwen dense API + BGE-M3 sparse + BM25 + BGE-Reranker | 本机运行 |
-| 前端 | Vue 3 + Element Plus | 本机运行, 默认 5174 |
+| 前端 | Vue 3 + Element Plus | 本机运行, 默认 5178 |
 
 LLM 和 OCR-VL 服务可以部署在局域网其他机器上，后端通过 `config.yaml` 指定其地址。
 
@@ -145,10 +145,10 @@ retrieval:
 
 ```bash
 cd src
-uvicorn api.main:app --host 0.0.0.0 --port 8000
+uvicorn api.main:app --host 0.0.0.0 --port 8008
 ```
 
-- API 文档: `http://<server-ip>:8000/docs`
+- API 文档: `http://<server-ip>:8008/docs`
 - 健康检查: `GET /health` → `{"status":"ok",...}`
 
 ### 首次运行
@@ -178,7 +178,7 @@ cd src/ui-vue2
 npm install
 
 # 开发模式
-npm run dev          # http://<server-ip>:5174
+npm run dev          # http://<server-ip>:5178
 
 # 生产构建
 npm run build        # 产物在 dist/
@@ -188,17 +188,17 @@ npm run preview
 **后端不在本机时**，设置环境变量:
 
 ```bash
-VITE_API_BASE=http://<server-ip>:8000 npm run dev
+VITE_API_BASE=http://<server-ip>:8008 npm run dev
 ```
 
 或创建 `src/ui-vue2/.env`:
 ```
-VITE_API_BASE=http://<server-ip>:8000
+VITE_API_BASE=http://<server-ip>:8008
 ```
 
 ## 5. 防火墙 / 网络
 
-- 后端 8000 端口需对前端所在机器开放（含 SSE 流式长连接）。
+- 后端 8008 端口需对前端所在机器开放（含 SSE 流式长连接）。
 - LLM/OCR-VL 服务端口（18000/8080 等）需对后端所在机器开放。
 - 如通过浏览器访问前端，确保前端 → 后端跨域允许（后端已启用 CORS）。
 

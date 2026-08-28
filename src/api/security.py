@@ -108,7 +108,7 @@ def cors_origins(config: Mapping[str, object]) -> list[str]:
     security = config.get("security", {})
     security = security if isinstance(security, Mapping) else {}
     configured = security.get(
-        "cors_origins", ["http://localhost:5174", "http://127.0.0.1:5174"]
+        "cors_origins", ["http://localhost:5178", "http://127.0.0.1:5178"]
     )
     if not isinstance(configured, list):
         raise AuthConfigurationError("security.cors_origins must be a list")

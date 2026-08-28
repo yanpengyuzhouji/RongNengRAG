@@ -1,9 +1,9 @@
 // 后端 API 地址: 优先读环境变量；未配置时跟随当前页面主机。
 // 这样局域网设备访问前端时不会把 localhost 误指向客户端自身。
-// 部署时可通过 .env 或命令行配置: VITE_API_BASE=http://192.168.x.x:8000 npm run dev
+// 部署时可通过 .env 或命令行配置: VITE_API_BASE=http://192.168.x.x:8008 npm run dev
 const pageHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost'
 const pageProtocol = typeof window !== 'undefined' ? window.location.protocol : 'http:'
-const BASE = (import.meta.env?.VITE_API_BASE || `${pageProtocol}//${pageHost}:8000`).replace(/\/$/, '')
+const BASE = (import.meta.env?.VITE_API_BASE || `${pageProtocol}//${pageHost}:8008`).replace(/\/$/, '')
 
 function authHeaders() {
   const key = sessionStorage.getItem('rongneng_api_key') || import.meta.env?.VITE_API_KEY || ''

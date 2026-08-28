@@ -284,6 +284,52 @@ def _llm_error_message(exc: Exception = None) -> str:
     return _llm_init_error or "LLM 未初始化，请检查 LLM 服务配置。"
 
 
+_CASUAL_GREETING_PREFIXES = (
+    "你好", "您好", "嗨", "哈喽", "hello", "hi", "hey",
+    "早上好", "上午好", "中午好", "下午好", "晚上好",
+)
+_CASUAL_GREETING_SUFFIXES = {
+    "", "啊", "呀", "喽", "哟", "测试", "测试下", "测试一下",
+    "试试", "试一下", "接口测试", "在吗", "你在吗", "请问你在吗",
+    "你好吗",
+}
+_CASUAL_REPLIES = {
+    "greeting": (
+        "你好！我是榕能知识库助手，可以帮你检索和解答已入库的电力设计、"
+        "标准规范等资料。请直接输入你的问题或文档名称。"
+    ),
+    "thanks": "不客气！如果需要查询知识库资料，请直接告诉我你的问题。",
+    "goodbye": "再见！需要查询资料时随时可以回来。",
+}
+
+
+def _casual_reply(query: str) -> Optional[str]:
+    """Return a deterministic reply for lightweight conversational messages.
+
+    Greetings and connection tests do not need embeddings, Milvus, reranking,
+    or an LLM request. Keeping them out of the RAG path makes the assistant
+    responsive even when the knowledge base is empty or an embedding service
+    is temporarily unavailable. Substantive questions continue to require a
+    knowledge-base hit, which preserves the system's anti-hallucination rule.
+    """
+    text = re.sub(r"[\s，。！？!?、,.；;:：~～]+", "", str(query or "").strip().casefold())
+    if not text:
+        return None
+
+    if text in {"谢谢", "谢谢你", "感谢", "多谢", "thx", "thanks", "thankyou"}:
+        return _CASUAL_REPLIES["thanks"]
+    if text in {"再见", "拜拜", "bye", "goodbye"}:
+        return _CASUAL_REPLIES["goodbye"]
+
+    for prefix in _CASUAL_GREETING_PREFIXES:
+        if text.startswith(prefix):
+            suffix = text[len(prefix):]
+            if suffix in _CASUAL_GREETING_SUFFIXES:
+                return _CASUAL_REPLIES["greeting"]
+            break
+    return None
+
+
 def get_conv_mgr():
     global _conv_mgr
     if _conv_mgr is None:
@@ -1433,6 +1479,21 @@ def _build_sources_from_results(results, citations):
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest):
     t0 = time.time()
+
+    casual_answer = _casual_reply(req.query)
+    if casual_answer is not None:
+        if req.conversation_id:
+            conv_mgr = get_conv_mgr()
+            conv_mgr.add_message(req.conversation_id, "user", req.query)
+            conv_mgr.add_message(req.conversation_id, "assistant", casual_answer)
+        return AskResponse(
+            query=req.query,
+            answer=casual_answer,
+            citations=[],
+            sources=[],
+            elapsed_ms=(time.time() - t0) * 1000,
+        )
+
     r = get_retriever()
 
     # === 统计型查询: 全量元数据聚合, 不走语义搜索 ===
@@ -1596,6 +1657,20 @@ async def ask_stream(req: AskRequest):
 
     def generate():
         t0 = time.time()
+
+        casual_answer = _casual_reply(req.query)
+        if casual_answer is not None:
+            # Conversation messages are still persisted for the same session
+            # contract as a normal answer, but no retrieval/embedding work is
+            # needed for a greeting or a connection test.
+            yield f"data: {json.dumps({'status': 'thinking', 'done': False, 'sources_count': 0})}\n\n"
+            yield f"data: {json.dumps({'token': casual_answer, 'done': False})}\n\n"
+            if req.conversation_id:
+                conv_mgr = get_conv_mgr()
+                conv_mgr.add_message(req.conversation_id, "user", req.query)
+                conv_mgr.add_message(req.conversation_id, "assistant", casual_answer)
+            yield f"data: {json.dumps({'token': '', 'done': True, 'citations': [], 'sources': [], 'elapsed_ms': (time.time() - t0) * 1000, 'full_answer': casual_answer})}\n\n"
+            return
 
         # === 阶段0: 发送连接成功心跳 ===
         yield f"data: {json.dumps({'status': 'searching', 'done': False})}\n\n"
@@ -1830,4 +1905,4 @@ app.include_router(_excel_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, timeout_keep_alive=600)
+    uvicorn.run("main:app", host="0.0.0.0", port=8008, reload=False, timeout_keep_alive=600)
